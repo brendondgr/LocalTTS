@@ -11,12 +11,15 @@ import time
 import uuid
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field
 
-from . import __version__, audio, voices
+from . import __version__, audio, enhance, voices
 from .config import settings
 from .engines import ENGINES, EngineError, transcribe
 
@@ -57,6 +60,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LocalTTS", version=__version__, lifespan=lifespan)
 
+# The web UI may talk to another LocalTTS (e.g. a remote GPU box behind `ssh -L`), which is a
+# different origin. Allow loopback origins only, so arbitrary websites cannot drive the API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-LocalTTS-Engine", "X-LocalTTS-Voice", "X-LocalTTS-Saved", "X-LocalTTS-Path",
+                    "X-Audio-Duration", "X-RTF", "X-Generation-Seconds", "X-Sample-Rate"],
+)
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "web", html=True), name="ui")
+
+
+@app.middleware("http")
+async def _revalidate_ui(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/ui"):
+        response.headers["Cache-Control"] = "no-cache"  # always pick up UI updates (304 when unchanged)
+    return response
+
 
 @app.exception_handler(EngineError)
 async def _engine_error(_, exc: EngineError):
@@ -69,9 +92,14 @@ def _engine(name: str):
     return ENGINES[name]
 
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return {"service": "localtts", "version": __version__, "docs": "/docs", "health": "/health"}
+    return RedirectResponse("/ui/")
+
+
+@app.get("/v1")
+def info():
+    return {"service": "localtts", "version": __version__, "ui": "/ui/", "docs": "/docs", "health": "/health"}
 
 
 @app.get("/health")
@@ -83,6 +111,7 @@ def health():
         "engines": {n: e.status() for n, e in ENGINES.items()},
         "voices": len(voices.all_voices()),
         "data": str(settings.data),
+        "outputs": str(settings.outputs_dir),
     }
 
 
@@ -257,6 +286,8 @@ class SpeechRequest(BaseModel):
     format: Format = Field("wav", validation_alias=AliasChoices("format", "response_format"))
     stream: bool = Field(False, description="stream raw PCM s16le as it is generated")
     no_save: bool = Field(False, description="return the audio only; nothing is written to disk")
+    save_dir: str | None = Field(None, description="folder to save into (on the server); relative paths "
+                                                   "are under the default outputs folder (~/Music/TTS)")
 
 
 def _resolve(req: SpeechRequest) -> tuple[str, str, dict]:
@@ -271,7 +302,7 @@ def _resolve(req: SpeechRequest) -> tuple[str, str, dict]:
             raise HTTPException(400, f"{name!r} is a Kokoro voice; Breeze uses custom voices or an instruction")
         if req.instruction:
             raise HTTPException(400, "Kokoro does not take an instruction")
-        return "kokoro", name.lower(), dict(text=req.text, voice=name.lower(), speed=req.speed)
+        return "kokoro", name.lower(), dict(text=enhance.strip_tags(req.text), voice=name.lower(), speed=req.speed)
     if name:
         v = voices.get(name)
         if v is None:
@@ -285,7 +316,7 @@ def _resolve(req: SpeechRequest) -> tuple[str, str, dict]:
         if req.instruction:
             raise HTTPException(400, "Kokoro does not take an instruction")
         v = settings.default_kokoro_voice
-        return "kokoro", v, dict(text=req.text, voice=v, speed=req.speed)
+        return "kokoro", v, dict(text=enhance.strip_tags(req.text), voice=v, speed=req.speed)
     return "breeze", "design", dict(text=req.text, instruction=req.instruction,
                                     cfg_scale=req.cfg_scale, seed=req.seed)
 
@@ -304,9 +335,16 @@ async def _collect(engine, params: dict) -> tuple[bytes, dict]:
     return b"".join(parts), stats
 
 
-def _output_path(voice: str, fmt: str) -> Path:
+def _output_path(voice: str, fmt: str, save_dir: str | None = None) -> Path:
+    folder = settings.outputs_dir
+    if save_dir and save_dir.strip():
+        folder = settings.outputs_dir / Path(save_dir.strip()).expanduser()  # absolute paths win
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(400, f"cannot save into {str(folder)!r}: {exc.strerror}") from exc
     stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{voices.slug(voice) or 'voice'}_{uuid.uuid4().hex[:6]}"
-    return settings.outputs_dir / f"{stem}.{fmt if fmt != 'pcm' else 'wav'}"
+    return folder / f"{stem}.{fmt if fmt != 'pcm' else 'wav'}"
 
 
 async def _speak(req: SpeechRequest):
@@ -317,7 +355,7 @@ async def _speak(req: SpeechRequest):
     if req.stream:
         await engine.ensure_loaded()
         sr = engine.info.get("sample_rate", 24000)
-        out_path = None if req.no_save else _output_path(voice, "wav")
+        out_path = None if req.no_save else _output_path(voice, "wav", req.save_dir)
 
         async def body():
             parts = []
@@ -335,8 +373,11 @@ async def _speak(req: SpeechRequest):
 
         headers = {**base_headers, "X-Sample-Rate": str(sr), "X-Sample-Format": "s16le", "X-Channels": "1",
                    "X-LocalTTS-Saved": out_path.name if out_path else "no"}
+        if out_path:
+            headers["X-LocalTTS-Path"] = quote(str(out_path))
         return StreamingResponse(body(), media_type="audio/pcm", headers=headers)
 
+    out = None if req.no_save else _output_path(voice, req.format, req.save_dir)  # fail before generating
     pcm, stats = await _collect(engine, params)
     sr = engine.info.get("sample_rate", 24000)
     data = audio.encode(pcm, sr, req.format)
@@ -346,10 +387,9 @@ async def _speak(req: SpeechRequest):
     if req.no_save:
         headers["X-LocalTTS-Saved"] = "no"
     else:
-        out = _output_path(voice, req.format)
         out.write_bytes(data if req.format != "pcm" else audio.encode(pcm, sr, "wav"))
         headers["X-LocalTTS-Saved"] = out.name
-        headers["X-LocalTTS-Path"] = str(out)
+        headers["X-LocalTTS-Path"] = quote(str(out))  # percent-encoded: headers are latin-1
     if req.format == "pcm":
         headers["X-Sample-Format"] = "s16le"
     ext = req.format
@@ -371,14 +411,53 @@ class OpenAISpeech(BaseModel):
     response_format: Format = "mp3"
     speed: float = 1.0
     no_save: bool = False
+    save_dir: str | None = None
 
 
 @app.post("/v1/audio/speech")
 async def openai_speech(body: OpenAISpeech):
     engine = body.model if body.model in ("breeze", "kokoro") else "auto"
     req = SpeechRequest(text=body.input, name=body.voice, engine=engine, instruction=body.instructions,
-                        format=body.response_format, speed=body.speed, no_save=body.no_save)
+                        format=body.response_format, speed=body.speed, no_save=body.no_save,
+                        save_dir=body.save_dir)
     return await _speak(req)
+
+
+# ---- AI-Enhance ----------------------------------------------------------------------------
+
+class EnhanceRequest(BaseModel):
+    text: str
+    style: Literal["subtle", "expressive"] = "subtle"
+    model: str | None = Field(None, description="LLM model id; default LOCALTTS_LLM_MODEL")
+    direction: str | None = Field(None, description="the current instruction, as context for the LLM")
+
+
+@app.get("/v1/enhance/tags")
+def enhance_tags():
+    return {"engine": "breeze", "syntax": "(tag)",
+            "tags": [{"tag": t, "description": d} for t, d in enhance.TAGS.items()],
+            "experimental": [{"tag": t, "description": d} for t, d in enhance.EXPERIMENTAL.items()]}
+
+
+@app.get("/v1/enhance/models")
+async def enhance_models():
+    try:
+        return await enhance.models()
+    except enhance.EnhanceError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/v1/enhance")
+async def enhance_text(body: EnhanceRequest):
+    """Add Breeze vocal-event tags and suggest a delivery, using an LLM. Returns text for review."""
+    if not body.text.strip():
+        raise HTTPException(400, "text is empty")
+    if len(body.text) > enhance.MAX_ENHANCE_CHARS:
+        raise HTTPException(413, f"enhance takes up to {enhance.MAX_ENHANCE_CHARS} characters at a time")
+    try:
+        return await enhance.enhance(body.text, body.style, body.model, body.direction)
+    except enhance.EnhanceError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # ---- saved outputs -----------------------------------------------------------------------

@@ -25,6 +25,11 @@ class Settings:
     kokoro_python: Path = _path("LOCALTTS_KOKORO_PYTHON", "~/venvs/kokoro/bin/python")
     default_engine: str = os.environ.get("LOCALTTS_DEFAULT_ENGINE", "kokoro")
     default_kokoro_voice: str = os.environ.get("LOCALTTS_DEFAULT_KOKORO_VOICE", "af_heart")
+    # AI-Enhance: any OpenAI-compatible chat endpoint (default: the DashLLM relay on this machine).
+    llm_url: str = os.environ.get("LOCALTTS_LLM_URL", "http://127.0.0.1:4000/v1").rstrip("/")
+    llm_model: str = os.environ.get("LOCALTTS_LLM_MODEL", "auto")
+    llm_api_key: str = os.environ.get("LOCALTTS_LLM_API_KEY", "")
+    llm_timeout_s: float = float(os.environ.get("LOCALTTS_LLM_TIMEOUT_S", "120"))
     preload: tuple[str, ...] = field(default_factory=lambda: tuple(
         e for e in os.environ.get("LOCALTTS_PRELOAD", "").split(",") if e))
 

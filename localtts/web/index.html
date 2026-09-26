@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LocalTTS</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- ============ sidebar ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <div class="brand"><img src="icon.svg" alt="" width="22" height="22"><span>LocalTTS</span></div>
+      <button class="icon-btn only-mobile" data-action="close-sidebar" title="Close menu" aria-label="Close menu">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <button class="new-chat" data-action="new-chat">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>New chat
+    </button>
+    <nav class="chat-list" id="chat-list" aria-label="Chats"></nav>
+    <div class="side-foot">
+      <button class="side-link" data-action="open-voices">
+        <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Voices
+      </button>
+      <button class="side-link" data-action="open-settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings
+      </button>
+      <button class="backend-pill" data-action="open-settings" id="backend-pill" title="Backend">
+        <span class="dot" id="backend-dot"></span><span id="backend-label">Connecting…</span>
+      </button>
+    </div>
+  </aside>
+  <div class="scrim" data-action="close-sidebar"></div>
+
+  <!-- ============ main ============ -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" data-action="open-sidebar" title="Menu" aria-label="Menu">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <h1 class="chat-title" id="chat-title">New chat</h1>
+      <div class="engines" id="engines" title="Engines on the current backend"></div>
+      <button class="icon-btn" data-action="toggle-theme" title="Toggle theme" aria-label="Toggle theme">
+        <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </header>
+
+    <section class="thread" id="thread" aria-live="polite">
+      <div class="empty" id="empty">
+        <img src="icon.svg" alt="" width="44" height="44">
+        <h2>What should I say?</h2>
+        <p>Type text, pick a voice, and get audio back. <span class="muted">Enhance adds sighs, laughs and a delivery direction for Breeze voices.</span></p>
+        <div class="suggestions" id="suggestions"></div>
+      </div>
+      <div class="turns" id="turns"></div>
+    </section>
+
+    <!-- ============ composer ============ -->
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="notice" id="enhance-notice" hidden></div>
+      <div class="box">
+        <textarea id="text" rows="1" placeholder="Type something to say…" aria-label="Text to speak"></textarea>
+        <div class="direction" id="direction-row" hidden>
+          <svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+          <input id="direction" type="text" placeholder="Direction: e.g. whisper, nervous and quick">
+          <button type="button" class="icon-btn small" data-action="clear-direction" title="Clear" aria-label="Clear direction">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+        <div class="toolbar">
+          <label class="voice-select" title="Voice">
+            <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/></svg>
+            <select id="voice" aria-label="Voice"></select>
+          </label>
+          <button type="button" class="tool" data-action="toggle-direction" id="btn-direction" title="Direction / emotion (Breeze)">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg><span>Direction</span>
+          </button>
+          <div class="menu-wrap">
+            <button type="button" class="tool" data-action="toggle-tags" id="btn-tags" title="Insert an audio tag (Breeze)">
+              <svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><path d="M7.5 7.5h.01"/></svg><span>Tags</span>
+            </button>
+            <div class="menu" id="tags-menu" hidden></div>
+          </div>
+          <button type="button" class="tool accent" data-action="enhance" id="btn-enhance" title="AI-Enhance: add audio tags and a delivery">
+            <svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8zM5 2l.6 1.4L7 4l-1.4.6L5 6l-.6-1.4L3 4l1.4-.6z"/></svg><span>Enhance</span>
+          </button>
+          <div class="spacer"></div>
+          <div class="menu-wrap">
+            <button type="button" class="icon-btn" data-action="toggle-options" id="btn-options" title="Output options" aria-label="Output options">
+              <svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+            </button>
+            <div class="menu options" id="options-menu" hidden>
+              <label class="row switch"><span>Save on the backend<small id="save-where">~/Music/TTS</small></span>
+                <input type="checkbox" id="opt-save"><i></i></label>
+              <label class="row" id="save-dir-row"><span>Save folder</span>
+                <input type="text" id="opt-save-dir" placeholder="default"></label>
+              <label class="row"><span>Format</span>
+                <select id="opt-format"><option>wav</option><option>mp3</option><option>flac</option><option>ogg</option></select></label>
+              <label class="row breeze-only"><span>Seed</span><input type="number" id="opt-seed" value="42"></label>
+              <label class="row breeze-only"><span>Guidance <small>cfg, blank = auto</small></span>
+                <input type="number" id="opt-cfg" min="0.5" max="10" step="0.5" placeholder="auto"></label>
+              <label class="row kokoro-only"><span>Speed</span>
+                <input type="number" id="opt-speed" min="0.5" max="2" step="0.05" value="1"></label>
+              <label class="row"><span>Enhance style</span>
+                <select id="opt-style"><option value="subtle">Subtle</option><option value="expressive">Expressive</option></select></label>
+            </div>
+          </div>
+          <button type="submit" class="send" id="btn-send" title="Generate (Enter)" aria-label="Generate">
+            <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="foot muted" id="foot">Enter to generate · Shift+Enter for a new line</p>
+    </form>
+  </main>
+</div>
+
+<!-- ============ voices dialog ============ -->
+<dialog class="dialog" id="voices-dialog">
+  <div class="dlg-head">
+    <h3>Voices</h3>
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="saved" role="tab">Saved</button>
+      <button class="tab" data-tab="add" role="tab">Add voice</button>
+      <button class="tab" data-tab="design" role="tab">Design voice</button>
+    </div>
+    <button class="icon-btn" data-action="close-dialog" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="dlg-body">
+    <section class="pane" data-pane="saved">
+      <p class="muted small">Saved voices clone with Breeze. They live on the current backend (<span class="backend-name"></span>).</p>
+      <div class="voice-list" id="voice-list"></div>
+    </section>
+
+    <section class="pane" data-pane="add" hidden>
+      <form id="add-form" class="stack">
+        <label class="field"><span>Name</span><input name="name" required maxlength="64" placeholder="e.g. Brendon"></label>
+        <div class="field"><span>Reference audio <small>3–60 s; 10–25 s of clean speech works best</small></span>
+          <div class="drop" id="drop">
+            <input type="file" id="add-file" accept="audio/*,video/*" hidden>
+            <button type="button" class="btn" data-action="pick-file">Choose file</button>
+            <button type="button" class="btn" data-action="record" id="btn-record">
+              <span class="rec-dot"></span><span id="record-label">Record</span></button>
+            <span class="muted small" id="file-label">or drop a file here</span>
+          </div>
+          <audio id="add-preview" controls hidden></audio>
+        </div>
+        <label class="field"><span>Transcript <small>exact words spoken; leave empty and Whisper writes it</small></span>
+          <textarea name="transcript" rows="3" placeholder="Optional"></textarea></label>
+        <label class="check"><input type="checkbox" name="overwrite"> Replace a voice with the same name</label>
+        <div class="actions"><span class="status small" id="add-status"></span>
+          <button class="btn primary" type="submit">Save voice</button></div>
+      </form>
+    </section>
+
+    <section class="pane" data-pane="design" hidden>
+      <form id="design-form" class="stack">
+        <p class="muted small">Breeze invents a voice from a description and keeps a sample of it, so it sounds the same every time.</p>
+        <label class="field"><span>Name</span><input name="name" required maxlength="64" placeholder="e.g. Narrator"></label>
+        <label class="field"><span>Description</span>
+          <textarea name="instruction" rows="3" required placeholder="A calm, deep documentary narrator with a slight British accent."></textarea></label>
+        <label class="check"><input type="checkbox" name="overwrite"> Replace a voice with the same name</label>
+        <div class="actions"><span class="status small" id="design-status"></span>
+          <button class="btn primary" type="submit">Design &amp; save</button></div>
+      </form>
+    </section>
+  </div>
+</dialog>
+
+<!-- ============ settings dialog ============ -->
+<dialog class="dialog narrow" id="settings-dialog">
+  <div class="dlg-head">
+    <h3>Settings</h3>
+    <button class="icon-btn" data-action="close-dialog" aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="dlg-body stack">
+    <section class="stack">
+      <h4>Backend</h4>
+      <label class="radio"><input type="radio" name="backend" value="local"> <span>This machine <small class="muted" id="local-url"></small></span></label>
+      <label class="radio"><input type="radio" name="backend" value="custom"> <span>Another LocalTTS</span></label>
+      <div class="inline">
+        <input type="url" id="backend-url" placeholder="http://localhost:5041">
+        <button type="button" class="btn" data-action="test-backend">Test</button>
+      </div>
+      <p class="status small" id="backend-status"></p>
+      <details class="help">
+        <summary>Using a remote GPU</summary>
+        <p>Run LocalTTS on the GPU machine (it stays on its own <code>127.0.0.1:5040</code>), then forward it here:</p>
+        <pre>ssh -N -L 5041:127.0.0.1:5040 user@gpu-box</pre>
+        <p>and use <code>http://localhost:5041</code>. Voices and saved files live on that machine; AI-Enhance still runs here.</p>
+      </details>
+    </section>
+    <section class="stack">
+      <h4>Engines <small class="muted" id="idle-note"></small></h4>
+      <div id="engine-controls" class="engine-controls"></div>
+    </section>
+    <section class="stack">
+      <h4>AI-Enhance</h4>
+      <label class="field"><span>Model <small class="muted" id="llm-url"></small></span>
+        <select id="llm-model"></select></label>
+      <p class="status small" id="llm-status"></p>
+    </section>
+    <section class="stack">
+      <h4>History</h4>
+      <p class="muted small">Chats are kept in this browser. Audio made with saving off is kept only until you reload.</p>
+      <div><button type="button" class="btn danger" data-action="clear-history">Delete all chats</button></div>
+    </section>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
