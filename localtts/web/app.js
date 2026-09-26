@@ -27,7 +27,7 @@ const SVG = {
 const PREFS_KEY = "localtts.prefs";
 const prefs = Object.assign({
   backend: "local", backendUrl: "", voice: "k:af_heart", format: "wav", save: true, saveDir: "",
-  seed: 42, cfg: "", speed: 1, style: "subtle", llmModel: "", theme: "", chat: "",
+  seed: 42, cfg: "", speed: 1, style: "subtle", llmModel: "", chat: "",
 }, (() => { try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; } })());
 function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* private mode */ } }
 
@@ -148,6 +148,7 @@ async function refreshHealth() {
   const dot = $("#backend-dot"), label = $("#backend-label");
   try {
     state.health = await http("/health");
+    $("#brand-sub").textContent = `speech API · v${state.health.version}`;
     dot.className = "dot ok";
     label.textContent = backendName();
   } catch (e) {
@@ -761,11 +762,6 @@ function closeMenus(except) {
   for (const id of ["#tags-menu", "#options-menu"]) if (id !== except) $(id).hidden = true;
 }
 
-function applyTheme() {
-  if (prefs.theme) document.documentElement.dataset.theme = prefs.theme;
-  else delete document.documentElement.dataset.theme;
-}
-
 function setupSettings() {
   const radios = document.querySelectorAll('input[name="backend"]'), url = $("#backend-url");
   $("#local-url").textContent = LOCAL;
@@ -855,13 +851,6 @@ function wire() {
       case "open-settings":
         setupSettingsValues(); refreshHealth(); loadLlmModels(); testBackend(); $("#settings-dialog").showModal(); break;
       case "close-dialog": el.closest("dialog").close(); break;
-      case "toggle-theme": {
-        const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-        const now = prefs.theme || (dark ? "dark" : "light");
-        prefs.theme = now === "dark" ? "light" : "dark";
-        if (prefs.theme === (dark ? "dark" : "light")) prefs.theme = "";  // back to following the system
-        savePrefs(); applyTheme(); break;
-      }
       case "toggle-direction": {
         const row = $("#direction-row"); row.hidden = !row.hidden;
         el.classList.toggle("on", !row.hidden);
@@ -913,7 +902,6 @@ function setupSettingsValues() {
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
-  applyTheme();
   wire();
   setupSettings();
   bindOptions();

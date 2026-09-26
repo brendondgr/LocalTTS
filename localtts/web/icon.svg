@@ -1,1 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="#6d4aff"/><g stroke="#fff" stroke-width="2.6" stroke-linecap="round"><path d="M8 13v6M12.5 9v14M17 12v8M21.5 7v18M26 14v4"/></g></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="LocalTTS: a waveform in cyan and amber">
+  <!-- Drawn in the DashLLM relay's mark style (dark tile, the dashboard's cyan and amber). -->
+  <rect x="2" y="2" width="252" height="252" rx="56" fill="#11151D" stroke="#2A3547" stroke-width="4"/>
+  <g fill="none" stroke-width="15" stroke-linecap="round">
+    <path d="M64 112v32" stroke="#E6EAF2"/>
+    <path d="M96 82v92" stroke="#58C4DD"/>
+    <path d="M128 60v136" stroke="#E6EAF2"/>
+    <path d="M160 88v80" stroke="#FFB224"/>
+    <path d="M192 108v40" stroke="#E6EAF2"/>
+  </g>
+</svg>
