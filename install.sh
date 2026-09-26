@@ -20,7 +20,7 @@ done
 command -v ffmpeg >/dev/null || echo "  WARNING: ffmpeg not on PATH; voice uploads need it"
 
 echo "== config"
-mkdir -p "$CONF_DIR" "$ROOT/data/voices" "$ROOT/data/outputs"
+mkdir -p "$CONF_DIR" "$ROOT/data/voices"
 [[ -f "$CONF_DIR/localtts.env" ]] || cp "$ROOT/localtts.env.example" "$CONF_DIR/localtts.env"
 echo "  $CONF_DIR/localtts.env"
 

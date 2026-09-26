@@ -82,7 +82,7 @@ curl http://127.0.0.1:5040/v1/voices/design -H 'content-type: application/json' 
 | `no_save` | false | **return the audio only; nothing is written to disk** |
 
 ```bash
-# saved to data/outputs/ and returned
+# saved to ~/Music/TTS/ and returned
 curl http://127.0.0.1:5040/v1/speech -H 'content-type: application/json' \
      -d '{"text": "Hello there.", "name": "Brendon"}' -o hello.wav
 
@@ -114,6 +114,9 @@ response_format, speed}` (plus `no_save`), so OpenAI TTS clients work by pointin
 base URL at `http://127.0.0.1:5040/v1`. `model` may be `breeze`, `kokoro` or anything else (auto).
 
 ### Saved outputs
+
+Everything generated without `no_save` lands in `~/Music/TTS/` (change it with
+`LOCALTTS_OUTPUTS_DIR`).
 
 ```bash
 curl http://127.0.0.1:5040/v1/outputs                     # list (newest first)
@@ -149,8 +152,8 @@ client ──HTTP──> localtts (FastAPI, .venv)  ──stdin/stdout──> br
   a one-shot Whisper large-v3-turbo process that exits right after.
 - Deletes use `unlink`/`rmtree`: permanent, never the desktop Trash.
 
-Data lives in `data/` (git-ignored): `data/voices/<name>/{reference.wav,voice.json}` and
-`data/outputs/`.
+Saved voices live in `data/voices/<name>/{reference.wav,voice.json}` (git-ignored).
+Generated audio goes to `~/Music/TTS/` (`LOCALTTS_OUTPUTS_DIR`) unless `no_save` is set.
 
 ## Install / reinstall
 
@@ -175,6 +178,7 @@ Edit `~/.config/localtts/localtts.env`, then `localtts restart`. Common ones:
 | `LOCALTTS_PORT` | 5040 | |
 | `LOCALTTS_HOST` | 127.0.0.1 | `0.0.0.0` exposes it to the network; there is **no auth** |
 | `LOCALTTS_IDLE_UNLOAD_S` | 600 | idle seconds before an engine leaves the GPU |
+| `LOCALTTS_OUTPUTS_DIR` | `~/Music/TTS` | where generated audio is saved (unless `no_save`) |
 | `LOCALTTS_PRELOAD` | empty | e.g. `breeze` to load at service start |
 | `LOCALTTS_DEFAULT_ENGINE` | kokoro | engine for requests with no voice and no instruction |
 | `LOCALTTS_BREEZE_FAST` | `depth_decoder,backbone_decode` | empty = eager (RTF ~2.7, no warmup) |

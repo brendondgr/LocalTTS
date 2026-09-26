@@ -18,6 +18,7 @@ class Settings:
     host: str = os.environ.get("LOCALTTS_HOST", "127.0.0.1")
     port: int = int(os.environ.get("LOCALTTS_PORT", "5040"))
     data: Path = _path("LOCALTTS_DATA", str(ROOT / "data"))
+    outputs: Path = _path("LOCALTTS_OUTPUTS_DIR", "~/Music/TTS")
     idle_unload_s: float = float(os.environ.get("LOCALTTS_IDLE_UNLOAD_S", "600"))
     load_timeout_s: float = float(os.environ.get("LOCALTTS_LOAD_TIMEOUT_S", "900"))
     breeze_python: Path = _path("LOCALTTS_BREEZE_PYTHON", "~/venvs/breeze-next/bin/python")
@@ -33,7 +34,7 @@ class Settings:
 
     @property
     def outputs_dir(self) -> Path:
-        return self.data / "outputs"
+        return self.outputs
 
 
 settings = Settings()
