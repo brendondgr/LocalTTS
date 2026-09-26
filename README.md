@@ -2,9 +2,11 @@
 
 An always-on local text-to-speech API on **http://127.0.0.1:5040**, backed by
 **Breeze TTS 2** (voice cloning, voice design, voice direction) and **Kokoro-82M**
-(fast built-in voices). It runs in the background as a systemd user service, starts at
-boot, and keeps nothing on the GPU while unused: each engine is unloaded after
-**10 minutes** without a request, and loads again on the next one.
+(fast built-in voices). It runs in the background (a systemd user service on Linux, a
+LaunchAgent on macOS, or a plain background process), starts at boot, and keeps nothing on
+the GPU while unused: each engine is unloaded after **10 minutes** without a request, and
+loads again on the next one. The installer looks at the machine first and sets the engines up
+for its GPU: NVIDIA (CUDA), AMD (ROCm), or CPU.
 
 **Web UI: http://127.0.0.1:5040** (`localtts ui` opens it) · API docs: http://127.0.0.1:5040/docs
 
@@ -137,6 +139,7 @@ curl http://127.0.0.1:5040/v1/voices/design -H 'content-type: application/json' 
 | `format` | `wav` | `wav` `flac` `mp3` `ogg` `pcm` (raw s16le, 24 kHz mono) |
 | `stream` | false | stream raw PCM s16le as it is generated |
 | `no_save` | false | **return the audio only; nothing is written to disk** |
+| `timings` | false | return JSON `{audio (base64), timings: {duration, words: [{w, start, end}]}}`; Kokoro gives native word times, Breeze is aligned with Whisper |
 | `save_dir` | `~/Music/TTS` | folder to save into (on the server); relative paths are under `~/Music/TTS` |
 
 ```bash
@@ -197,19 +200,28 @@ curl -X DELETE http://127.0.0.1:5040/v1/outputs/<file>    # permanent (no trash)
 
 One request at a time per engine; Breeze and Kokoro can run side by side.
 
+### Word timings for existing clips
+
+`POST /v1/align` (multipart): `items` = JSON `[{"id", "text"}]` plus one file `audio_<id>`
+per item → `{"items": {id: {duration, sample_rate, words}}}`. Whisper runs once for the
+batch and matches its words back to your text, so the timings carry your exact words and
+punctuation. video-maker uses this for captions and cue timing.
+
 ## How it works
 
 ```
-client ──HTTP──> localtts (FastAPI, .venv)  ──stdin/stdout──> breeze_worker.py  (~/venvs/breeze-next)
-                                           └─stdin/stdout──> kokoro_worker.py  (~/venvs/kokoro)
+client ──HTTP──> localtts (FastAPI, .venv)  ──stdin/stdout──> breeze_worker.py  (Breeze env)
+                                           └─stdin/stdout──> kokoro_worker.py  (Kokoro env)
 ```
 
-- Each engine is a subprocess in **its own venv**; the server never installs into them.
+- Each engine is a subprocess in **its own venv**; the server never installs into them. Which
+  venv, and the backend/dtype/fast stages for this GPU, come from the engine registry
+  (`~/.config/tts-engines/engines.json`, written by `engines/setup.sh`); env vars override.
   Audio comes back over a pipe (JSON header + PCM bytes), so `no_save` really touches no disk.
 - **Unload = stop the worker process**, which returns every byte of GPU memory. A reaper
   checks every 15 s and stops any engine idle for `LOCALTTS_IDLE_UNLOAD_S` (600).
-- Breeze runs with the `depth_decoder` + `backbone_decode` fast stages (the fastest
-  combination on this GPU that also handles long references). The torch.compile cache
+- Breeze runs with the fast stages the installer chose: `depth_decoder` + `backbone_decode`
+  on NVIDIA and on AMD gfx1151 (tested), eager elsewhere or on the CPU. The torch.compile cache
   lives in `~/.cache/localtts/inductor` so it survives reboots.
 - Voice uploads are converted by ffmpeg to 24 kHz mono WAV; missing transcripts come from
   a one-shot Whisper large-v3-turbo process that exits right after.
@@ -221,16 +233,37 @@ Generated audio goes to `~/Music/TTS/` (`LOCALTTS_OUTPUTS_DIR`) unless `no_save`
 ## Install / reinstall
 
 ```bash
-./install.sh
+git clone https://github.com/brendondgr/LocalTTS && cd LocalTTS
+./install.sh                # server + `localtts` command + boot service; offers to set up engines
+./install.sh --engines      # also set up the TTS engines now
+./install.sh --no-service   # no boot service (`localtts start` runs it in the background)
 ```
 
-Creates `.venv`, installs `~/.config/systemd/user/localtts.service` (enabled, with linger
-so it starts at boot without a login), copies `localtts.env.example` to
-`~/.config/localtts/localtts.env`, and links `localtts` into `~/.local/bin`. Idempotent.
+**Engines.** `engines/setup.sh` installs Kokoro and Breeze for *this* machine. It looks first
+(`bash engines/setup.sh --plan` changes nothing): GPU vendor and model, NVIDIA compute
+capability and driver CUDA version, AMD gfx target and VRAM/unified memory, OS, disk, tools,
+and what is already installed. Then it explains the plan, including which combinations are
+untested, and installs only after you agree (and accept Breeze's non-commercial licence):
 
-Requirements: `uv`, `ffmpeg`, the Breeze checkout (`~/Projects/breeze-tts`, branch
-`rocm-port`) with weights in `~/models/breeze-tts-2` and its venv `~/venvs/breeze-next`,
-and the Kokoro venv `~/venvs/kokoro`.
+| Machine | Kokoro | Breeze |
+|---|---|---|
+| NVIDIA sm_80+ | CUDA | PyTorch 2.9.1 CUDA, bf16, fast stages |
+| NVIDIA sm_70/75 (Turing, Volta) | CUDA | same in fp16 (untested) |
+| AMD gfx1151 (Strix Halo) | ROCm nightly | AMD whl-next PyTorch, bf16, fast stages (tested) |
+| other AMD with ROCm | ROCm nightly | TheRock nightly, eager (untested) |
+| Apple Silicon | MPS | CPU only, very slow (opt-in) |
+| no GPU | CPU (fine) | CPU only, very slow (opt-in) |
+
+It is the same installer the video-maker skill ships (`engines/` is a copy of its `tts/`;
+`scripts/sync-engines.sh` refreshes it), and both record what they install in
+`~/.config/tts-engines/engines.json`, so engines installed by either are used by both.
+Voices saved here are visible to `breeze-tts` too.
+
+**Service.** `localtts enable` installs whichever the machine has: a systemd user unit with
+linger (Linux; starts at boot), a LaunchAgent (macOS; starts at login; untested), or nothing,
+in which case `localtts start` runs it as a background process with a pid file.
+
+Requirements: `uv`, `git`, `ffmpeg`.
 
 ## Configuration
 
@@ -247,7 +280,10 @@ Edit `~/.config/localtts/localtts.env`, then `localtts restart`. Common ones:
 | `LOCALTTS_DEFAULT_ENGINE` | kokoro | engine for requests with no voice and no instruction |
 | `LOCALTTS_LLM_URL` | `http://127.0.0.1:4000/v1` | OpenAI-compatible endpoint for AI-Enhance |
 | `LOCALTTS_LLM_MODEL` | `auto` | model id sent to it (the UI can pick another) |
-| `LOCALTTS_BREEZE_FAST` | `depth_decoder,backbone_decode` | empty = eager (RTF ~2.7, no warmup) |
+| `LOCALTTS_BREEZE_FAST` | from the registry | empty = eager (RTF ~2.7 on gfx1151, no warmup) |
+| `LOCALTTS_BREEZE_PYTHON` / `LOCALTTS_KOKORO_PYTHON` | from the registry | engine environments |
+| `BREEZE_DTYPE`, `BREEZE_DEVICE`, `BREEZE_REPO`, `BREEZE_MODEL` | from the registry | Breeze precision, device, source, weights |
+| `LOCALTTS_NO_SYSTEMD` | empty | `1` = run as a plain background process even where systemd exists |
 
 The full list is in `localtts.env.example`.
 

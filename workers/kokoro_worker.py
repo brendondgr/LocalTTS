@@ -45,11 +45,19 @@ class Kokoro:
         if lang not in ("a", "b"):
             raise ValueError(f"unsupported Kokoro voice {voice!r} (only a*/b* English voices)")
         t_start = time.perf_counter()
-        ttfa, samples = None, 0
+        ttfa, samples, words = None, 0, []
         for r in self.pipeline(lang)(text, voice=voice, speed=speed):
             if r.audio is None:
                 continue
             audio = r.audio.detach().cpu().numpy().astype(np.float32)
+            offset = samples / SAMPLE_RATE
+            for t in r.tokens or []:   # word timings, as kokoro-tts writes them
+                if not any(ch.isalnum() for ch in t.text):
+                    if words and t.text.strip():
+                        words[-1]["w"] += t.text.strip()   # punctuation rides on the previous word
+                    continue
+                if t.start_ts is not None and t.end_ts is not None:
+                    words.append({"w": t.text, "start": round(offset + t.start_ts, 3), "end": round(offset + t.end_ts, 3)})
             if ttfa is None:
                 ttfa = time.perf_counter() - t_start
             _proto.send_audio(audio)
@@ -58,7 +66,7 @@ class Kokoro:
         audio_s = samples / SAMPLE_RATE
         _proto.send("done", audio_s=round(audio_s, 3), gen_s=round(gen_s, 3),
                     rtf=round(gen_s / audio_s, 3) if audio_s else None,
-                    ttfa_ms=round(ttfa * 1000, 1) if ttfa is not None else None)
+                    ttfa_ms=round(ttfa * 1000, 1) if ttfa is not None else None, words=words)
 
 
 def main() -> None:

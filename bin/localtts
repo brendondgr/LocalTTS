@@ -1,72 +1,157 @@
 #!/usr/bin/env bash
-# localtts - control the LocalTTS background service (systemd user unit `localtts`).
-# Generation goes through the HTTP API; this only manages the service.
+# localtts - control the LocalTTS background service.
+# Generation goes through the HTTP API and web UI; this only manages the service.
+#
+# How it runs in the background depends on the machine:
+#   systemd   Linux: a user unit `localtts` (starts at boot with linger)
+#   launchd   macOS: a LaunchAgent (starts at login)          [untested]
+#   process   anything else, or LOCALTTS_NO_SYSTEMD=1: a background process with a pid file
 set -euo pipefail
 
 UNIT=localtts
 ENV_FILE="$HOME/.config/localtts/localtts.env"
 
-# Inside a toolbox/distrobox the user's systemd lives on the host: hop out.
-if [[ -f /run/.containerenv || -f /.dockerenv ]] && command -v flatpak-spawn >/dev/null 2>&1; then
-  exec flatpak-spawn --host "$(readlink -f "$0")" "$@"
+# Inside a toolbox/distrobox the user's service manager lives on the host: hop out.
+if [[ -z "${LOCALTTS_NO_HOST:-}" ]] && [[ -f /run/.containerenv || -f /run/.toolboxenv ]]; then
+  if command -v flatpak-spawn >/dev/null 2>&1; then exec flatpak-spawn --host "$(readlink -f "$0")" "$@"
+  elif command -v distrobox-host-exec >/dev/null 2>&1; then exec distrobox-host-exec "$(readlink -f "$0")" "$@"; fi
 fi
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-PORT=5040
-HOST=127.0.0.1
+PY="$ROOT/.venv/bin/python"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/localtts"
+PIDFILE="$STATE/localtts.pid" LOGFILE="$STATE/localtts.log"
+PLIST="$HOME/Library/LaunchAgents/io.localtts.server.plist"
+PORT=5040 HOST=127.0.0.1
 if [[ -f "$ENV_FILE" ]]; then
   PORT="$(sed -nE 's/^[[:space:]]*LOCALTTS_PORT=([0-9]+).*/\1/p' "$ENV_FILE" | tail -1)"; PORT="${PORT:-5040}"
 fi
 URL="http://$HOST:$PORT"
-PY="$ROOT/.venv/bin/python"
+
+if [[ -n "${LOCALTTS_NO_SYSTEMD:-}" ]]; then MODE=process
+elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then MODE=systemd
+elif [[ "$(uname -s)" == Darwin ]]; then MODE=launchd
+else MODE=process; fi
 
 usage() {
   cat <<EOF
-usage: localtts <command>
+usage: localtts <command>          (service manager here: $MODE)
 
   start            start the API in the background ($URL)
   stop             stop it (engines are unloaded from the GPU)
   restart          stop + start
   status           service state, engine state, idle timers
   logs [-f] [N]    last N log lines (default 100); -f to follow
-  enable|disable   start automatically at boot (on by default after install)
+  enable|disable   start automatically at boot/login
   load [engine]    load an engine now (breeze|kokoro; default breeze)
   unload [engine]  unload an engine now (default: all)
   voices           list saved and built-in voices
   ui               open the web UI in the browser
   url              print the base URL (web UI there, API docs at \$URL/docs)
+  serve            run in the foreground (what the service runs)
 EOF
 }
 
-api() {  # api METHOD PATH
-  curl -fsS -m "${TIMEOUT:-10}" -X "$1" "$URL$2" 2>/dev/null
-}
-
+api() { curl -fsS -m "${TIMEOUT:-10}" -X "$1" "$URL$2" 2>/dev/null; }
 wait_up() {
-  for _ in $(seq 1 40); do
-    api GET /health >/dev/null && return 0
-    sleep 0.25
-  done
-  echo "localtts: service started but the API is not answering yet; see 'localtts logs'" >&2
-  return 1
+  for _ in $(seq 1 60); do api GET /health >/dev/null && return 0; sleep 0.25; done
+  echo "localtts: started but the API is not answering yet; see 'localtts logs'" >&2; return 1
 }
+need_up() { api GET /health >/dev/null || { echo "localtts: API not reachable at $URL (try 'localtts start')" >&2; exit 1; }; }
+pid_alive() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
-need_up() {
-  api GET /health >/dev/null || { echo "localtts: API not reachable at $URL (try 'localtts start')" >&2; exit 1; }
+# ---- service manager back ends ----------------------------------------------------------------
+svc_enable() {
+  case "$MODE" in
+    systemd)
+      mkdir -p "$HOME/.config/systemd/user"
+      sed "s|@ROOT@|$ROOT|g" "$ROOT/systemd/localtts.service" > "$HOME/.config/systemd/user/localtts.service"
+      systemctl --user daemon-reload
+      systemctl --user enable "$UNIT" >/dev/null
+      # Linger lets user services start at boot without anyone logging in.
+      if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]]; then
+        loginctl enable-linger "$USER" 2>/dev/null || echo "  (no linger: it will start at login instead of boot)"
+      fi
+      echo "localtts: will start at boot (systemd user unit)" ;;
+    launchd)
+      mkdir -p "$(dirname "$PLIST")" "$STATE"
+      cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.localtts.server</string>
+  <key>ProgramArguments</key><array><string>$ROOT/bin/localtts</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>$LOGFILE</string>
+  <key>StandardErrorPath</key><string>$LOGFILE</string>
+</dict></plist>
+EOF
+      launchctl unload "$PLIST" 2>/dev/null || true
+      launchctl load -w "$PLIST"
+      echo "localtts: will start at login (LaunchAgent $PLIST)" ;;
+    process)
+      echo "localtts: no service manager here; start it with 'localtts start' (or add that to your login)" ;;
+  esac
+}
+svc_disable() {
+  case "$MODE" in
+    systemd) systemctl --user disable "$UNIT"; echo "localtts: will not start at boot" ;;
+    launchd) launchctl unload -w "$PLIST" 2>/dev/null || true; rm -f "$PLIST"; echo "localtts: LaunchAgent removed" ;;
+    process) echo "localtts: nothing to disable" ;;
+  esac
+}
+svc_start() {
+  case "$MODE" in
+    systemd)
+      [[ -f "$HOME/.config/systemd/user/localtts.service" ]] || svc_enable
+      systemctl --user start "$UNIT" ;;
+    launchd) [[ -f "$PLIST" ]] || svc_enable; launchctl start io.localtts.server ;;
+    process)
+      pid_alive && return 0
+      mkdir -p "$STATE"
+      nohup "$ROOT/bin/localtts" serve >>"$LOGFILE" 2>&1 < /dev/null &
+      echo $! > "$PIDFILE" ;;
+  esac
+}
+svc_stop() {
+  case "$MODE" in
+    systemd) systemctl --user stop "$UNIT" ;;
+    launchd) launchctl stop io.localtts.server 2>/dev/null || true ;;
+    process)
+      if pid_alive; then
+        kill "$(cat "$PIDFILE")"
+        for _ in $(seq 1 60); do pid_alive || break; sleep 0.25; done
+      fi
+      rm -f "$PIDFILE" ;;
+  esac
+}
+svc_state() {
+  case "$MODE" in
+    systemd) echo "$(systemctl --user is-active "$UNIT" 2>/dev/null || true) (autostart: $(systemctl --user is-enabled "$UNIT" 2>/dev/null || true))" ;;
+    launchd) launchctl list io.localtts.server >/dev/null 2>&1 && echo "loaded (LaunchAgent)" || echo "not loaded" ;;
+    process) pid_alive && echo "running (pid $(cat "$PIDFILE"))" || echo "stopped" ;;
+  esac
 }
 
 cmd="${1:-status}"; shift || true
 case "$cmd" in
+  serve)
+    cd "$ROOT"
+    if [[ -f "$ENV_FILE" ]]; then set -a; . "$ENV_FILE"; set +a; fi
+    PYTHONUNBUFFERED=1 exec "$PY" -m localtts ;;
   start)
-    systemctl --user start "$UNIT"; wait_up && echo "localtts: running at $URL" ;;
+    svc_start; wait_up && echo "localtts: running at $URL" ;;
   stop)
-    systemctl --user stop "$UNIT"; echo "localtts: stopped" ;;
+    svc_stop; echo "localtts: stopped" ;;
   restart)
-    systemctl --user restart "$UNIT"; wait_up && echo "localtts: restarted at $URL" ;;
+    if [[ "$MODE" == systemd ]]; then
+      [[ -f "$HOME/.config/systemd/user/localtts.service" ]] || svc_enable
+      systemctl --user restart "$UNIT"
+    else svc_stop; svc_start; fi
+    wait_up && echo "localtts: restarted at $URL" ;;
   status)
-    state="$(systemctl --user is-active "$UNIT" 2>/dev/null || true)"
-    boot="$(systemctl --user is-enabled "$UNIT" 2>/dev/null || true)"
-    echo "service: $state (autostart: $boot)  $URL"
+    echo "service: $(svc_state)  $URL  [$MODE]"
     if health="$(api GET /health)"; then
       "$PY" - "$health" <<'EOF'
 import json, sys
@@ -84,13 +169,12 @@ EOF
   logs)
     follow=(); n=100
     for a in "$@"; do [[ "$a" == -f ]] && follow=(-f) || n="$a"; done
-    journalctl --user -u "$UNIT" -n "$n" --no-hostname -o short-iso "${follow[@]}" ;;
-  enable)
-    systemctl --user enable "$UNIT"; echo "localtts: will start at boot" ;;
-  disable)
-    systemctl --user disable "$UNIT"; echo "localtts: will not start at boot" ;;
+    if [[ "$MODE" == systemd ]]; then journalctl --user -u "$UNIT" -n "$n" --no-hostname -o short-iso "${follow[@]}"
+    else tail -n "$n" "${follow[@]}" "$LOGFILE"; fi ;;
+  enable) svc_enable ;;
+  disable) svc_disable ;;
   load)
-    need_up; echo "loading ${1:-breeze} (Breeze takes ~1 min cold)..."
+    need_up; echo "loading ${1:-breeze} (Breeze takes ~30 s cold)..."
     TIMEOUT=900 api POST "/v1/load?engine=${1:-breeze}" | "$PY" -m json.tool ;;
   unload)
     need_up; api POST "/v1/unload${1:+?engine=$1}" | "$PY" -m json.tool ;;
@@ -107,11 +191,9 @@ print("kokoro built-in:", " ".join(v["kokoro"]))
 print("breeze design:  ", v["breeze_design"])' ;;
   ui)
     need_up; echo "$URL"
-    xdg-open "$URL" >/dev/null 2>&1 & disown ;;
-  url)
-    echo "$URL" ;;
-  -h|--help|help)
-    usage ;;
-  *)
-    usage >&2; exit 2 ;;
+    if command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 & disown
+    elif command -v open >/dev/null 2>&1; then open "$URL"; fi ;;
+  url) echo "$URL" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
 esac

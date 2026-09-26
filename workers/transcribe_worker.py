@@ -31,8 +31,9 @@ MODEL = os.environ.get("LOCALTTS_WHISPER_MODEL", "openai/whisper-large-v3-turbo"
 def main() -> None:
     path, language = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else None)
     try:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        asr = pipeline("automatic-speech-recognition", model=MODEL, dtype=torch.float16, device=device)
+        gpu = torch.cuda.is_available()
+        asr = pipeline("automatic-speech-recognition", model=MODEL, dtype=torch.float16 if gpu else torch.float32,
+                       device="cuda:0" if gpu else "cpu")
         audio, sr = librosa.load(path, sr=16000, mono=True)
         kwargs = {"language": language} if language else {}
         text = asr({"raw": np.ascontiguousarray(audio), "sampling_rate": sr},

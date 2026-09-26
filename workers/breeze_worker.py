@@ -1,4 +1,4 @@
-"""Breeze TTS 2 worker. Runs under the Breeze venv (default ~/venvs/breeze-next).
+"""Breeze TTS 2 worker. Runs under the Breeze venv recorded by engines/setup.sh.
 
 Loads the model once, warms the fast stages, then serves generate requests over the
 protocol in _proto.py. Covers voice design (instruction only), voice clone (reference
@@ -25,6 +25,7 @@ _proto.claim_stdout()
 REPO = Path(os.environ.get("BREEZE_REPO", "~/Projects/breeze-tts")).expanduser()
 MODEL = Path(os.environ.get("BREEZE_MODEL", "~/models/breeze-tts-2")).expanduser()
 FAST = [s for s in os.environ.get("LOCALTTS_BREEZE_FAST", "depth_decoder,backbone_decode").split(",") if s]
+DEVICE = os.environ.get("BREEZE_DEVICE", "auto")   # auto | cuda (NVIDIA or AMD ROCm) | cpu
 STAGES = ("text_encoder", "backbone_prefill", "backbone_decode", "depth_decoder", "codec")
 SEGMENT_CHARS = int(os.environ.get("LOCALTTS_BREEZE_SEGMENT_CHARS", "400"))
 GAP_S = 0.25
@@ -69,15 +70,17 @@ class Breeze:
         if unknown:
             raise ValueError(f"LOCALTTS_BREEZE_FAST has unknown stages: {sorted(unknown)}")
         t0 = time.perf_counter()
+        self.device = resolve_device(None if DEVICE in ("auto", "cuda") else DEVICE)
+        self.fast = FAST if self.device.startswith("cuda") else []   # fast stages are CUDA/HIP graphs
         self.tokenizer, self.model, self.audio_tokenizer = load_runtime(
-            MODEL, device=resolve_device(), attn_implementation="eager"
+            MODEL, device=self.device, attn_implementation="eager"
         )
         update_generation_config_for_breeze(self.model)
         config = FastStreamingConfig(
             max_new_tokens=1500,
             max_seq_len=2048,
             repetition_penalty=1.1,
-            **{f"fast_{s}": s in FAST for s in STAGES},
+            **{f"fast_{s}": s in self.fast for s in STAGES},
         )
         self.runtime = FastBreezeStreamingRuntime(
             self.model, self.audio_tokenizer, config, tokenizer=self.tokenizer
@@ -86,7 +89,8 @@ class Breeze:
             profile = load_warmup_profile(REPO / "configs" / "fast.json")
             profile = replace(profile, codec_chunk_frames=self.runtime.codec_chunk_frames)
             self.runtime.warmup_from_profile(profile)
-        torch.cuda.synchronize()
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
         self.load_s = time.perf_counter() - t0
         self.sample_rate = self.runtime.sample_rate
 
@@ -135,10 +139,10 @@ class Breeze:
 
 def main() -> None:
     engine = Breeze()
-    _proto.log(f"breeze ready in {engine.load_s:.1f}s, fast stages: {FAST or 'none'}")
+    _proto.log(f"breeze ready in {engine.load_s:.1f}s on {engine.device}, fast stages: {engine.fast or 'none'}")
     _proto.send("ready", sample_rate=engine.sample_rate, load_s=round(engine.load_s, 1),
-                fast=FAST, torch=torch.__version__,
-                device=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
+                fast=engine.fast, torch=torch.__version__, dtype=os.environ.get("BREEZE_DTYPE", "bf16"),
+                device=torch.cuda.get_device_name(0) if engine.device.startswith("cuda") else "cpu")
     _proto.serve({"generate": engine.generate})
 
 

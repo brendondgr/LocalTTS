@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import re
 import tempfile
@@ -13,7 +15,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +23,7 @@ from pydantic import AliasChoices, BaseModel, Field
 
 from . import __version__, audio, enhance, voices
 from .config import settings
-from .engines import ENGINES, EngineError, transcribe
+from .engines import ENGINES, EngineError, align_clips, transcribe
 
 log = logging.getLogger("localtts")
 
@@ -288,6 +290,8 @@ class SpeechRequest(BaseModel):
     no_save: bool = Field(False, description="return the audio only; nothing is written to disk")
     save_dir: str | None = Field(None, description="folder to save into (on the server); relative paths "
                                                    "are under the default outputs folder (~/Music/TTS)")
+    timings: bool = Field(False, description="return JSON {audio (base64), timings: {duration, words}} instead "
+                                             "of audio; Kokoro gives native word times, Breeze is aligned with Whisper")
 
 
 def _resolve(req: SpeechRequest) -> tuple[str, str, dict]:
@@ -357,7 +361,7 @@ async def _speak(req: SpeechRequest):
     engine = ENGINES[engine_name]
     base_headers = {"X-LocalTTS-Engine": engine_name, "X-LocalTTS-Voice": voice, "Cache-Control": "no-store"}
 
-    if req.stream:
+    if req.stream and not req.timings:   # timings needs the whole clip
         await engine.ensure_loaded()
         sr = engine.info.get("sample_rate", 24000)
         save_fmt = req.format if req.format != "pcm" else "wav"
@@ -400,6 +404,19 @@ async def _speak(req: SpeechRequest):
         out.write_bytes(data if req.format != "pcm" else audio.encode(pcm, sr, "wav"))
         headers["X-LocalTTS-Saved"] = out.name
         headers["X-LocalTTS-Path"] = quote(str(out))  # percent-encoded: headers are latin-1
+    if req.timings:
+        words = stats.get("words")
+        if words is None:   # Breeze reports no word times: align the clip with Whisper
+            with tempfile.TemporaryDirectory(prefix="localtts-align-") as tmp:
+                wav = Path(tmp) / "clip.wav"
+                wav.write_bytes(audio.encode(pcm, sr, "wav"))
+                job = Path(tmp) / "job.json"
+                job.write_text(json.dumps([{"id": "clip", "text": params["text"], "path": str(wav)}]))
+                words = (await align_clips(job))["clip"]["words"]
+        return JSONResponse({"audio": base64.b64encode(data).decode(), "format": req.format, "sample_rate": sr,
+                             "engine": engine_name, "voice": voice, "saved": headers["X-LocalTTS-Saved"],
+                             "timings": {"duration": stats.get("audio_s"), "sample_rate": sr, "words": words},
+                             "stats": {k: v for k, v in stats.items() if k != "words"}})
     if req.format == "pcm":
         headers["X-Sample-Format"] = "s16le"
     ext = req.format
@@ -431,6 +448,44 @@ async def openai_speech(body: OpenAISpeech):
                         format=body.response_format, speed=body.speed, no_save=body.no_save,
                         save_dir=body.save_dir)
     return await _speak(req)
+
+
+# ---- word timings -------------------------------------------------------------------------
+
+@app.post("/v1/align")
+async def align(request: Request):
+    """Word timings for finished clips (e.g. video-maker captions and cues), via Whisper.
+
+    multipart: `items` = JSON [{"id", "text", "language"?}], plus one file `audio_<id>` per item.
+    Returns {"items": {id: {"duration", "sample_rate", "words": [{"w", "start", "end"}]}}}.
+    """
+    form = await request.form(max_files=500)
+    try:
+        items = json.loads(form.get("items") or "[]")
+    except ValueError as exc:
+        raise HTTPException(400, "`items` must be a JSON list of {id, text}") from exc
+    if not items:
+        raise HTTPException(400, "no items")
+    with tempfile.TemporaryDirectory(prefix="localtts-align-") as tmp:
+        job = []
+        for n, it in enumerate(items):
+            f = form.get(f"audio_{it.get('id')}")
+            if f is None or not hasattr(f, "read") or not str(it.get("text", "")).strip():
+                raise HTTPException(400, f"item {it.get('id')!r} needs text and a file field audio_{it.get('id')}")
+            raw = Path(tmp) / f"{n}.upload"
+            raw.write_bytes(await f.read())
+            wav = Path(tmp) / f"{n}.wav"
+            try:
+                await audio.to_reference_wav(str(raw), str(wav))
+            except ValueError as exc:
+                raise HTTPException(400, f"item {it['id']!r}: {exc}") from exc
+            job.append({"id": it["id"], "text": it["text"], "path": str(wav), "language": it.get("language", "en")})
+        job_file = Path(tmp) / "job.json"
+        job_file.write_text(json.dumps(job))
+        try:
+            return {"items": await align_clips(job_file)}
+        except EngineError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
 
 # ---- AI-Enhance ----------------------------------------------------------------------------

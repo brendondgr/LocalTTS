@@ -16,7 +16,7 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from .config import ROOT, settings
+from .config import ROOT, breeze_env, settings
 
 log = logging.getLogger("localtts.engines")
 WORKERS = ROOT / "workers"
@@ -175,28 +175,38 @@ class Engine:
             await self.unload(reason=f"abandoned request still running after {DRAIN_TIMEOUT_S:.0f}s")
 
 
-async def transcribe(path: Path, language: str | None = None) -> str:
-    """Run Whisper once in a throwaway process (Breeze venv) and return the text."""
-    args = [str(settings.breeze_python), str(WORKERS / "transcribe_worker.py"), str(path)]
-    if language:
-        args.append(language)
+async def _oneshot(script: str, args: list[str], what: str, timeout: float = 600) -> dict:
+    """Run a worker once in a throwaway process (Breeze venv, which has Whisper); return its result."""
+    if not settings.breeze_python.exists():
+        raise EngineError(f"{what} needs Whisper from the Breeze environment ({settings.breeze_python} not found)")
     proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=None, cwd=str(WORKERS),
-        env={**os.environ, "HF_HUB_OFFLINE": "1"},
+        str(settings.breeze_python), str(WORKERS / script), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=None, cwd=str(WORKERS),
+        env={**os.environ, "HF_HUB_OFFLINE": "1", **breeze_env()},
     )
-    out, _ = await asyncio.wait_for(proc.communicate(), 600)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     for line in out.decode().splitlines():
         msg = json.loads(line)
         if msg.get("event") == "result":
-            return msg["text"]
+            return msg
         if msg.get("event") == "error":
-            raise EngineError(f"transcription failed: {msg.get('message')}")
-    raise EngineError(f"transcription failed (exit {proc.returncode}); see `localtts logs`")
+            raise EngineError(f"{what} failed: {msg.get('message')}")
+    raise EngineError(f"{what} failed (exit {proc.returncode}); see `localtts logs`")
+
+
+async def transcribe(path: Path, language: str | None = None) -> str:
+    """Whisper transcript of a voice reference."""
+    return (await _oneshot("transcribe_worker.py", [str(path)] + ([language] if language else []), "transcription"))["text"]
+
+
+async def align_clips(job_file: Path) -> dict:
+    """Word timings for finished clips: {id: {duration, sample_rate, words}}."""
+    return (await _oneshot("align_worker.py", [str(job_file)], "alignment"))["items"]
 
 
 ENGINES: dict[str, Engine] = {
     "breeze": Engine("breeze", settings.breeze_python, "breeze_worker.py",
-                     env={"HF_HUB_OFFLINE": "1",
+                     env={"HF_HUB_OFFLINE": "1", **breeze_env(),
                           # Persistent torch.compile cache (the default lives in /tmp, wiped at boot).
                           "TORCHINDUCTOR_CACHE_DIR": str(Path("~/.cache/localtts/inductor").expanduser())}),
     "kokoro": Engine("kokoro", settings.kokoro_python, "kokoro_worker.py"),

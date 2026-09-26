@@ -1,0 +1,431 @@
+diff --git a/breeze_infer/runtime.py b/breeze_infer/runtime.py
+index 4fe70b3..117f37b 100644
+--- a/breeze_infer/runtime.py
++++ b/breeze_infer/runtime.py
+@@ -65,6 +65,18 @@ def update_generation_config_for_breeze(
+     vars(model.generation_config).update(generation_config)
+ 
+ 
++# Weight dtype. Upstream uses bf16; GPUs without native bf16 (NVIDIA Turing/Volta,
++# compute capability < 8.0) can set BREEZE_DTYPE=fp16, or fp32 as a correctness baseline.
++_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
++
++
++def model_dtype() -> torch.dtype:
++    name = os.environ.get("BREEZE_DTYPE", "bf16").lower()
++    if name not in _DTYPES:
++        raise ValueError(f"BREEZE_DTYPE must be one of {sorted(_DTYPES)}, got {name!r}")
++    return _DTYPES[name]
++
++
+ def load_runtime(
+     ckpt_dir: Path,
+     *,
+@@ -89,7 +101,7 @@ def load_runtime(
+     )
+     model = BreezeForConditionalGeneration.from_pretrained(
+         ckpt_dir,
+-        dtype=torch.bfloat16,
++        dtype=model_dtype(),
+         attn_implementation=attn_implementation,
+     )
+     model.to(device).eval()
+diff --git a/models/breeze.py b/models/breeze.py
+index ad3f615..e90a928 100644
+--- a/models/breeze.py
++++ b/models/breeze.py
+@@ -21,6 +21,8 @@ from collections.abc import Callable
+ 
+ from dataclasses import dataclass
+ 
++import os
++
+ import torch
+ from torch import nn
+ from transformers.activations import ACT2FN
+@@ -52,6 +54,14 @@ from .generation_breeze import BreezeGenerationMixin
+ logger = logging.get_logger(__name__)
+ 
+ 
++def _text_encoder_dtype() -> torch.dtype:
++    # bf16 upstream; BREEZE_DTYPE=fp16|fp32 for GPUs without native bf16. A module-level
++    # helper because __init__ below has its own local `import os`, which shadows the global.
++    return {"fp16": torch.float16, "fp32": torch.float32}.get(
++        os.environ.get("BREEZE_DTYPE", "").lower(), torch.bfloat16
++    )
++
++
+ def _resolve_text_encoder_attn_implementation(config) -> str:
+     """Honor an explicit top-level attention choice before checkpoint preference."""
+     caller_attn_implementation = getattr(config, "_attn_implementation", None)
+@@ -994,7 +1004,7 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
+                 self.text_encoder = AutoModel.from_config(
+                     config.text_encoder_config,
+                     attn_implementation=text_encoder_attn_implementation,
+-                    dtype=torch.bfloat16,
++                    dtype=_text_encoder_dtype(),
+                 )
+ 
+             text_encoder_proj_type = getattr(config, "text_encoder_proj_type", "linear")
+diff --git a/requirements.rocm.txt b/requirements.rocm.txt
+new file mode 100644
+index 0000000..0662704
+--- /dev/null
++++ b/requirements.rocm.txt
+@@ -0,0 +1,9 @@
++qwen-tts==0.1.1
++transformers==4.57.3
++numpy>=2.0
++soundfile>=0.13
++fastapi>=0.115
++uvicorn>=0.30
++python-multipart>=0.0.18
++pytest>=8.0
++ruff>=0.12
+diff --git a/tools/asr_check.py b/tools/asr_check.py
+new file mode 100644
+index 0000000..6fe1d82
+--- /dev/null
++++ b/tools/asr_check.py
+@@ -0,0 +1,50 @@
++"""Transcribe WAVs with Whisper and score them against the intended text (ROCm port QA).
++
++    python tools/asr_check.py "expected text" out1.wav [out2.wav ...]
++
++Prints the transcript and word error rate for each file. Vocal-event tags such as
++"(sigh)" are dropped from the expected text before scoring.
++"""
++
++from __future__ import annotations
++
++import re
++import sys
++
++import librosa
++import numpy as np
++import torch
++from transformers import pipeline
++
++MODEL = "openai/whisper-large-v3-turbo"
++
++
++def words(s: str) -> list[str]:
++    s = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", s.lower())
++    return re.findall(r"[a-z0-9']+", s)
++
++
++def wer(ref: list[str], hyp: list[str]) -> float:
++    d = list(range(len(hyp) + 1))
++    for i, r in enumerate(ref, 1):
++        prev, d[0] = d[0], i
++        for j, h in enumerate(hyp, 1):
++            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (r != h))
++    return d[-1] / max(len(ref), 1)
++
++
++def main() -> None:
++    expected, files = sys.argv[1], sys.argv[2:]
++    device = "cuda:0" if torch.cuda.is_available() else "cpu"
++    asr = pipeline("automatic-speech-recognition", model=MODEL, dtype=torch.float16, device=device)
++    for f in files:
++        # Whisper expects 16 kHz; the pipeline does not resample a raw array reliably.
++        audio, sr = librosa.load(f, sr=16000, mono=True)
++        text = asr({"raw": np.ascontiguousarray(audio), "sampling_rate": sr},
++                   return_timestamps=True,  # long-form mode, needed for clips over 30 s
++                   generate_kwargs={"language": "en"})["text"].strip()
++        print(f"{f}\tWER={wer(words(expected), words(text)):.2f}\t{text}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/gemm_bench.py b/tools/gemm_bench.py
+new file mode 100644
+index 0000000..2c9ac9d
+--- /dev/null
++++ b/tools/gemm_bench.py
+@@ -0,0 +1,59 @@
++"""Skinny-GEMM bandwidth check (decode-shaped matmuls, M = cfg batch) per BLAS backend.
++
++    python tools/gemm_bench.py
++"""
++
++import time
++
++import torch
++import torch.nn.functional as F
++
++SHAPES = {  # (in, out) of the layers that dominate per-frame decode
++    "depth gate_up 1024->16384": (1024, 16384),
++    "depth down 8192->1024": (8192, 1024),
++    "backbone gate_up 2048->12288": (2048, 12288),
++    "backbone down 6144->2048": (6144, 2048),
++    "backbone qkv 2048->4096": (2048, 4096),
++}
++
++
++def bench(fn, iters=200):
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(iters):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t) / iters
++
++
++def main():
++    dev = "cuda"
++    big = torch.empty(512 * 2**20, dtype=torch.uint8, device=dev)
++    dst = torch.empty_like(big)
++    s = bench(lambda: dst.copy_(big), 50)
++    print(f"copy bandwidth: {2 * big.numel() / s / 1e9:.0f} GB/s (read+write)")
++    default = torch.backends.cuda.preferred_blas_library()
++    backends = ["default"]
++    for name in ("hipblaslt", "cublas"):  # "cublas" selects rocBLAS on ROCm
++        try:
++            torch.backends.cuda.preferred_blas_library(name)
++            backends.append(name)
++        except Exception as e:
++            print(f"{name}: unavailable ({e})")
++    torch.backends.cuda.preferred_blas_library(default)  # probing above changed it
++    for be in backends:
++        if be != "default":
++            torch.backends.cuda.preferred_blas_library(be)
++        print(f"--- backend {be} ({torch.backends.cuda.preferred_blas_library()})")
++        for label, (k, n) in SHAPES.items():
++            w = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
++            for m in (1, 2):
++                x = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
++                sec = bench(lambda: F.linear(x, w))
++                print(f"  {label:30s} M={m}  {sec * 1e6:7.1f} us  {w.numel() * 2 / sec / 1e9:6.0f} GB/s")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/rocm_bench.py b/tools/rocm_bench.py
+new file mode 100644
+index 0000000..d561733
+--- /dev/null
++++ b/tools/rocm_bench.py
+@@ -0,0 +1,176 @@
++"""ROCm port benchmark: load once, run the same request N times, report warm numbers.
++
++Mirrors infer.py (same runtime, flags and request shape) and adds timing:
++  RTF  = generation wall time / audio seconds (prepare_inputs + streaming decode)
++  TTFA = wall time from the start of the request (before prepare_inputs) to the first chunk
++  peak = torch.cuda.max_memory_allocated() over the whole process
++
++    python tools/rocm_bench.py ~/models/breeze-tts-2 --text "..." --instruction "..." \
++        --cfg-scale 4 --runs 3 --output outputs/bench.wav [--fast-codec ...]
++
++Run 1 is the cold run (kernel compilation, MIOpen tuning); report runs 2+.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import sys
++import time
++from dataclasses import replace
++from pathlib import Path
++
++import numpy as np
++import soundfile as sf
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from breeze_infer.runtime import (  # noqa: E402
++    load_runtime,
++    resolve_device,
++    set_all_seeds,
++    update_generation_config_for_breeze,
++)
++from breeze_infer.templates import get_template, prepare_inputs, select_template_name  # noqa: E402
++from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig  # noqa: E402
++from models.warmup_profile import load_warmup_profile  # noqa: E402
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++FAST_CONFIG = REPO_ROOT / "configs" / "fast.json"
++STAGES = ("text_encoder", "backbone_prefill", "backbone_decode", "depth_decoder", "codec")
++
++
++def sync() -> None:
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
++def main() -> None:
++    p = argparse.ArgumentParser()
++    p.add_argument("model", type=Path)
++    p.add_argument("--text", required=True)
++    p.add_argument("--instruction")
++    p.add_argument("--ref-audio", type=Path)
++    p.add_argument("--ref-text")
++    p.add_argument("--output", type=Path, default=Path("outputs/bench.wav"))
++    p.add_argument("--seed", type=int, default=42)
++    p.add_argument("--cfg-scale", type=float, default=1.0)
++    p.add_argument("--runs", type=int, default=3)
++    p.add_argument("--label", default="")
++    p.add_argument("--json", type=Path, help="append the result as one JSON line")
++    p.add_argument("--profile", type=Path, help="profile one extra run; write top ops + a Chrome trace here")
++    p.add_argument("--fast-all", action=argparse.BooleanOptionalAction, default=None)
++    for s in STAGES:
++        p.add_argument(f"--fast-{s.replace('_', '-')}", action=argparse.BooleanOptionalAction, default=False)
++    args = p.parse_args()
++
++    t0 = time.perf_counter()
++    tokenizer, model, audio_tokenizer = load_runtime(
++        args.model, device=resolve_device(), attn_implementation="eager"
++    )
++    update_generation_config_for_breeze(model)
++    config = FastStreamingConfig(
++        max_new_tokens=1500,
++        max_seq_len=2048,
++        fast_all=args.fast_all,
++        repetition_penalty=1.1,
++        **{f"fast_{s}": getattr(args, f"fast_{s}") for s in STAGES},
++    )
++    runtime = FastBreezeStreamingRuntime(model, audio_tokenizer, config, tokenizer=tokenizer)
++    sync()
++    load_s = time.perf_counter() - t0
++    warmup_s = None
++    if runtime.fast_enabled:
++        t0 = time.perf_counter()
++        profile = load_warmup_profile(FAST_CONFIG)
++        profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
++        runtime.warmup_from_profile(profile)
++        sync()
++        warmup_s = time.perf_counter() - t0
++
++    request = {"id": "bench", "text": args.text, "speaker": "S0"}
++    if args.instruction:
++        request["instruction"] = args.instruction.strip()
++    if args.ref_audio is not None:
++        request["ref_audio_path"] = str(args.ref_audio)
++        request["ref_text"] = args.ref_text.strip()
++    template = get_template(select_template_name(request))
++
++    runs = []
++    for i in range(args.runs):
++        set_all_seeds(args.seed)
++        sync()
++        t_start = time.perf_counter()
++        inputs = prepare_inputs(
++            tokenizer, audio_tokenizer, model, [request], template,
++            guidance_scale=args.cfg_scale, guidance_scale_ref=None, guidance_scale_ins=None,
++        )
++        chunks, ttfa = [], None
++        for chunk in runtime.iter_audio_chunks(inputs, request_id=f"bench-{i}", seed=args.seed):
++            if ttfa is None:
++                ttfa = time.perf_counter() - t_start
++            chunks.append(np.asarray(chunk.audio, dtype=np.float32))
++        sync()
++        gen = time.perf_counter() - t_start
++        audio = np.concatenate(chunks) if chunks else np.zeros(0, np.float32)
++        dur = len(audio) / runtime.sample_rate
++        out = args.output.with_name(f"{args.output.stem}_run{i + 1}{args.output.suffix}")
++        out.parent.mkdir(parents=True, exist_ok=True)
++        sf.write(out, audio, runtime.sample_rate, subtype="PCM_16")
++        run = {
++            "run": i + 1,
++            "gen_s": round(gen, 3),
++            "audio_s": round(dur, 3),
++            "rtf": round(gen / dur, 3) if dur else None,
++            "ttfa_ms": round(ttfa * 1000, 1) if ttfa is not None else None,
++            "rms": round(float(np.sqrt((audio**2).mean())), 4) if dur else 0.0,
++            "nan": bool(np.isnan(audio).any()),
++            "out": str(out),
++        }
++        runs.append(run)
++        print(json.dumps(run), flush=True)
++
++    if args.profile:
++        from torch.profiler import ProfilerActivity, profile
++
++        set_all_seeds(args.seed)
++        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
++            inputs = prepare_inputs(
++                tokenizer, audio_tokenizer, model, [request], template,
++                guidance_scale=args.cfg_scale, guidance_scale_ref=None, guidance_scale_ins=None,
++            )
++            for _ in runtime.iter_audio_chunks(inputs, request_id="bench-profile", seed=args.seed):
++                pass
++            sync()
++        ka = prof.key_averages()
++        with args.profile.with_suffix(".txt").open("w") as f:
++            f.write(ka.table(sort_by="self_cuda_time_total", row_limit=40) + "\n")
++            f.write(ka.table(sort_by="self_cpu_time_total", row_limit=25) + "\n")
++        prof.export_chrome_trace(str(args.profile.with_suffix(".json")))
++        print(f"profile written to {args.profile.with_suffix('.txt')}", flush=True)
++
++    warm = runs[1:] or runs
++    result = {
++        "label": args.label,
++        "torch": torch.__version__,
++        "hip": torch.version.hip,
++        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
++        "load_s": round(load_s, 1),
++        "warmup_s": round(warmup_s, 1) if warmup_s is not None else None,
++        "cold": runs[0],
++        "warm_rtf": round(sum(r["rtf"] for r in warm) / len(warm), 3),
++        "warm_ttfa_ms": round(sum(r["ttfa_ms"] for r in warm) / len(warm), 1),
++        "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2) if torch.cuda.is_available() else None,
++    }
++    print("RESULT " + json.dumps(result), flush=True)
++    if args.json:
++        with args.json.open("a") as f:
++            f.write(json.dumps({**result, "runs": runs}) + "\n")
++    if any(not math.isfinite(r["rms"]) or r["nan"] for r in runs):
++        sys.exit(3)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/speaker_sim.py b/tools/speaker_sim.py
+new file mode 100644
+index 0000000..b788065
+--- /dev/null
++++ b/tools/speaker_sim.py
+@@ -0,0 +1,38 @@
++"""Speaker similarity for voice-clone QA: cosine similarity of WavLM x-vectors.
++
++    python tools/speaker_sim.py reference.wav out1.wav [out2.wav ...]
++
++Rough guide for microsoft/wavlm-base-plus-sv: ~0.86+ is usually the same speaker,
++below ~0.8 is usually a different one. A score for a different speaker's clip
++(e.g. a voice-design output) is a useful baseline.
++"""
++
++from __future__ import annotations
++
++import sys
++
++import librosa
++import torch
++from transformers import AutoFeatureExtractor, WavLMForXVector
++
++MODEL = "microsoft/wavlm-base-plus-sv"
++
++
++def main() -> None:
++    ref, outs = sys.argv[1], sys.argv[2:]
++    fe = AutoFeatureExtractor.from_pretrained(MODEL)
++    model = WavLMForXVector.from_pretrained(MODEL).eval()
++
++    def embed(path: str) -> torch.Tensor:
++        audio, _ = librosa.load(path, sr=16000, mono=True)
++        inputs = fe(audio, sampling_rate=16000, return_tensors="pt")
++        with torch.no_grad():
++            return torch.nn.functional.normalize(model(**inputs).embeddings, dim=-1)[0]
++
++    r = embed(ref)
++    for f in outs:
++        print(f"{f}\tsim={float(torch.dot(r, embed(f))):.3f}")
++
++
++if __name__ == "__main__":
++    main()
