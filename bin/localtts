@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# localtts - control the LocalTTS background service (systemd user unit `localtts`).
+# Generation goes through the HTTP API; this only manages the service.
+set -euo pipefail
+
+UNIT=localtts
+ENV_FILE="$HOME/.config/localtts/localtts.env"
+
+# Inside a toolbox/distrobox the user's systemd lives on the host: hop out.
+if [[ -f /run/.containerenv || -f /.dockerenv ]] && command -v flatpak-spawn >/dev/null 2>&1; then
+  exec flatpak-spawn --host "$(readlink -f "$0")" "$@"
+fi
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+PORT=5040
+HOST=127.0.0.1
+if [[ -f "$ENV_FILE" ]]; then
+  PORT="$(sed -nE 's/^[[:space:]]*LOCALTTS_PORT=([0-9]+).*/\1/p' "$ENV_FILE" | tail -1)"; PORT="${PORT:-5040}"
+fi
+URL="http://$HOST:$PORT"
+PY="$ROOT/.venv/bin/python"
+
+usage() {
+  cat <<EOF
+usage: localtts <command>
+
+  start            start the API in the background ($URL)
+  stop             stop it (engines are unloaded from the GPU)
+  restart          stop + start
+  status           service state, engine state, idle timers
+  logs [-f] [N]    last N log lines (default 100); -f to follow
+  enable|disable   start automatically at boot (on by default after install)
+  load [engine]    load an engine now (breeze|kokoro; default breeze)
+  unload [engine]  unload an engine now (default: all)
+  voices           list saved and built-in voices
+  url              print the base URL (API docs at \$URL/docs)
+EOF
+}
+
+api() {  # api METHOD PATH
+  curl -fsS -m "${TIMEOUT:-10}" -X "$1" "$URL$2" 2>/dev/null
+}
+
+wait_up() {
+  for _ in $(seq 1 40); do
+    api GET /health >/dev/null && return 0
+    sleep 0.25
+  done
+  echo "localtts: service started but the API is not answering yet; see 'localtts logs'" >&2
+  return 1
+}
+
+need_up() {
+  api GET /health >/dev/null || { echo "localtts: API not reachable at $URL (try 'localtts start')" >&2; exit 1; }
+}
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  start)
+    systemctl --user start "$UNIT"; wait_up && echo "localtts: running at $URL" ;;
+  stop)
+    systemctl --user stop "$UNIT"; echo "localtts: stopped" ;;
+  restart)
+    systemctl --user restart "$UNIT"; wait_up && echo "localtts: restarted at $URL" ;;
+  status)
+    state="$(systemctl --user is-active "$UNIT" 2>/dev/null || true)"
+    boot="$(systemctl --user is-enabled "$UNIT" 2>/dev/null || true)"
+    echo "service: $state (autostart: $boot)  $URL"
+    if health="$(api GET /health)"; then
+      "$PY" - "$health" <<'EOF'
+import json, sys
+h = json.loads(sys.argv[1])
+print(f"idle unload after {h['idle_unload_s']:.0f}s | {h['voices']} saved voice(s) | data: {h['data']}")
+for name, e in h["engines"].items():
+    line = f"  {name:7s} {e['state']}"
+    if e.get("pid"):
+        line += f"  pid {e['pid']}"
+    if e.get("unloads_in_s") is not None:
+        line += f"  idle {e['idle_s']:.0f}s, unloads in {e['unloads_in_s']:.0f}s"
+    print(line)
+EOF
+    fi ;;
+  logs)
+    follow=(); n=100
+    for a in "$@"; do [[ "$a" == -f ]] && follow=(-f) || n="$a"; done
+    journalctl --user -u "$UNIT" -n "$n" --no-hostname -o short-iso "${follow[@]}" ;;
+  enable)
+    systemctl --user enable "$UNIT"; echo "localtts: will start at boot" ;;
+  disable)
+    systemctl --user disable "$UNIT"; echo "localtts: will not start at boot" ;;
+  load)
+    need_up; echo "loading ${1:-breeze} (Breeze takes ~1 min cold)..."
+    TIMEOUT=900 api POST "/v1/load?engine=${1:-breeze}" | "$PY" -m json.tool ;;
+  unload)
+    need_up; api POST "/v1/unload${1:+?engine=$1}" | "$PY" -m json.tool ;;
+  voices)
+    need_up; api GET /v1/voices | "$PY" -c '
+import json, sys
+v = json.load(sys.stdin)
+print("saved (Breeze clone):")
+for c in v["custom"]:
+    print("  %-20s %5.1fs  %s" % (c["name"], c["duration_s"], c["source"]))
+if not v["custom"]:
+    print("  (none)")
+print("kokoro built-in:", " ".join(v["kokoro"]))
+print("breeze design:  ", v["breeze_design"])' ;;
+  url)
+    echo "$URL" ;;
+  -h|--help|help)
+    usage ;;
+  *)
+    usage >&2; exit 2 ;;
+esac

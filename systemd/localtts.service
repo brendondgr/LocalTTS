@@ -1,0 +1,24 @@
+# TEMPLATE. @ROOT@ is replaced with this clone's absolute path by install.sh.
+[Unit]
+Description=LocalTTS - Breeze TTS 2 + Kokoro speech API (127.0.0.1:5040)
+Documentation=file://@ROOT@/README.md
+After=network.target
+
+[Service]
+Type=exec
+WorkingDirectory=@ROOT@
+# Optional overrides (port, idle timeout, venv paths...); see localtts.env.example.
+EnvironmentFile=-%h/.config/localtts/localtts.env
+Environment=PYTHONUNBUFFERED=1
+# The venv's python directly: no resolver or sync on every boot.
+ExecStart=@ROOT@/.venv/bin/python -m localtts
+Restart=on-failure
+RestartSec=3
+# Engine workers live in this unit's cgroup, so stopping the service frees the GPU too.
+KillMode=control-group
+TimeoutStopSec=30
+# A GPU fault would otherwise leave a multi-GB gpucore.<pid> dump in the working dir.
+LimitCORE=0
+
+[Install]
+WantedBy=default.target
