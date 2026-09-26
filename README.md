@@ -240,6 +240,7 @@ Edit `~/.config/localtts/localtts.env`, then `localtts restart`. Common ones:
 |---|---|---|
 | `LOCALTTS_PORT` | 5040 | |
 | `LOCALTTS_HOST` | 127.0.0.1 | `0.0.0.0` exposes it to the network; there is **no auth** |
+| `LOCALTTS_KEEP_ALIVE_S` | 330 | idle keep-alive; keep it above the browser's (see Troubleshooting) |
 | `LOCALTTS_IDLE_UNLOAD_S` | 600 | idle seconds before an engine leaves the GPU |
 | `LOCALTTS_OUTPUTS_DIR` | `~/Music/TTS` | where generated audio is saved (unless `no_save`) |
 | `LOCALTTS_PRELOAD` | empty | e.g. `breeze` to load at service start |
@@ -251,6 +252,15 @@ Edit `~/.config/localtts/localtts.env`, then `localtts restart`. Common ones:
 The full list is in `localtts.env.example`.
 
 ## Troubleshooting
+
+- **"Can't reach LocalTTS at http://127.0.0.1:5040" during a generation** (fixed in 0.1.x).
+  uvicorn closes idle keep-alive connections after 5 s by default. When Firefox/LibreWolf
+  finds one of its pooled connections closed, it also drops any in-flight request that has not
+  received a byte yet, and a Breeze generation sends nothing until it finishes. The server now
+  keeps idle connections for 330 s (`LOCALTTS_KEEP_ALIVE_S`), longer than any browser does, so
+  the browser always closes first. Long texts (over 1,500 characters) are streamed by the UI,
+  which also keeps them clear of Firefox's 300 s wait-for-response limit.
+- `localhost` resolves to `::1` here, so the server listens on both `127.0.0.1` and `[::1]`.
 
 - `localtts logs` shows the server and both workers (worker lines start with `[worker]`).
 - A failed engine load reports `worker exited (code N)`; the traceback is in the log.

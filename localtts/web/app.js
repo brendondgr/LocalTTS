@@ -50,15 +50,21 @@ async function errorText(resp) {
   return `${resp.status} ${resp.statusText}`;
 }
 
-async function http(path, { base = backendBase(), json, form, method, signal, raw } = {}) {
+async function http(path, { base = backendBase(), json, form, method, signal, raw, retry = true } = {}) {
   const opts = { method: method || (json || form ? "POST" : "GET"), signal };
   if (json) { opts.headers = { "content-type": "application/json" }; opts.body = JSON.stringify(json); }
   if (form) opts.body = form;
   let resp;
+  const t0 = performance.now();
   try { resp = await fetch(base + path, opts); }
   catch (e) {
     if (e.name === "AbortError") throw e;
-    throw new Error(`Can't reach ${backendName(base)} (${base}). Is LocalTTS running there?`);
+    // A pooled keep-alive connection that closed under us fails instantly, before the server
+    // saw anything; one retry covers it. A slow failure is a real outage: report it.
+    if (retry && performance.now() - t0 < 1500) {
+      return http(path, { base, json, form, method, signal, raw, retry: false });
+    }
+    throw new Error(`Can't reach LocalTTS at ${base}. Is the service running? (localtts status)`);
   }
   if (!resp.ok) throw new Error(await errorText(resp));
   return raw ? resp : resp.json();
@@ -641,6 +647,47 @@ function refreshTurn(t) {
 
 // ---------------------------------------------------------------- generate
 
+// Long texts are streamed: Firefox-based browsers give up on a request after 300 s without
+// a response, and a long Breeze generation can take longer than that before it answers.
+const STREAM_CHARS = 1500;
+
+function wavBlob(chunks, sampleRate) {  // PCM s16le mono chunks -> WAV
+  const n = chunks.reduce((a, c) => a + c.byteLength, 0);
+  const h = new DataView(new ArrayBuffer(44));
+  const str = (o, s) => [...s].forEach((ch, i) => h.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, "RIFF"); h.setUint32(4, 36 + n, true); str(8, "WAVE"); str(12, "fmt ");
+  h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
+  h.setUint32(24, sampleRate, true); h.setUint32(28, sampleRate * 2, true);
+  h.setUint16(32, 2, true); h.setUint16(34, 16, true); str(36, "data"); h.setUint32(40, n, true);
+  return new Blob([h, ...chunks], { type: "audio/wav" });
+}
+
+async function speak(t, signal) {  // -> {blob, meta}
+  const stream = t.text.length > STREAM_CHARS;
+  const t0 = performance.now();
+  const resp = await http("/v1/speech", { base: t.backend, json: stream ? { ...t.params, stream: true } : t.params, signal, raw: true });
+  const h = k => resp.headers.get(k);
+  const meta = {
+    saved: h("X-LocalTTS-Saved") || "no", path: h("X-LocalTTS-Path") ? decodeURIComponent(h("X-LocalTTS-Path")) : "",
+    format: t.params.format,
+  };
+  if (!stream) {
+    const blob = await resp.blob();
+    return { blob, meta: { ...meta, duration: parseFloat(h("X-Audio-Duration")) || null, rtf: parseFloat(h("X-RTF")) || null,
+                           gen_s: parseFloat(h("X-Generation-Seconds")) || (performance.now() - t0) / 1000 } };
+  }
+  const sr = parseInt(h("X-Sample-Rate"), 10) || 24000, chunks = [];
+  const reader = resp.body.getReader();
+  try {
+    for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    throw new Error("The connection dropped while generating. See `localtts logs` for the cause.");
+  }
+  const bytes = chunks.reduce((a, c) => a + c.byteLength, 0);
+  return { blob: wavBlob(chunks, sr), meta: { ...meta, format: "wav", duration: bytes / 2 / sr, gen_s: (performance.now() - t0) / 1000 } };
+}
+
 function buildRequest() {
   const v = currentVoice();
   const text = $("#text").value.trim();
@@ -699,16 +746,8 @@ async function submitTurn(src) {
   }, 500);
   state.pending.set(t.id, { ctrl, timer });
   try {
-    const resp = await http("/v1/speech", { base: t.backend, json: t.params, signal: ctrl.signal, raw: true });
-    const blob = await resp.blob();
-    const h = k => resp.headers.get(k);
-    t.meta = {
-      duration: parseFloat(h("X-Audio-Duration")) || null, rtf: parseFloat(h("X-RTF")) || null,
-      gen_s: parseFloat(h("X-Generation-Seconds")) || (performance.now() - t0) / 1000,
-      saved: h("X-LocalTTS-Saved") || "no", path: h("X-LocalTTS-Path") ? decodeURIComponent(h("X-LocalTTS-Path")) : "",
-      format: t.params.format,
-    };
-    if (h("X-LocalTTS-Voice") && t.voice.kind === "design") t.voiceLabel = "Designed voice";
+    const { blob, meta } = await speak(t, ctrl.signal);
+    t.meta = meta;
     if (t.params.no_save) state.memAudio.set(t.id, blob);  // saving off: memory only
     else { await safe(db.put("audio", blob, t.id)); t.kept = true; state.memAudio.set(t.id, blob); }
     t.status = "done"; state.autoplay.add(t.id);

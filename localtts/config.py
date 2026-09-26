@@ -19,6 +19,7 @@ class Settings:
     port: int = int(os.environ.get("LOCALTTS_PORT", "5040"))
     data: Path = _path("LOCALTTS_DATA", str(ROOT / "data"))
     outputs: Path = _path("LOCALTTS_OUTPUTS_DIR", "~/Music/TTS")
+    keep_alive_s: int = int(os.environ.get("LOCALTTS_KEEP_ALIVE_S", "330"))  # > any browser's idle pool
     idle_unload_s: float = float(os.environ.get("LOCALTTS_IDLE_UNLOAD_S", "600"))
     load_timeout_s: float = float(os.environ.get("LOCALTTS_LOAD_TIMEOUT_S", "900"))
     breeze_python: Path = _path("LOCALTTS_BREEZE_PYTHON", "~/venvs/breeze-next/bin/python")

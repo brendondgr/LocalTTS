@@ -347,6 +347,11 @@ def _output_path(voice: str, fmt: str, save_dir: str | None = None) -> Path:
     return folder / f"{stem}.{fmt if fmt != 'pcm' else 'wav'}"
 
 
+def _log_done(engine: str, voice: str, stats: dict, out: Path | None, streamed: bool) -> None:
+    log.info("speech: %s/%s %.1fs audio in %.1fs%s -> %s", engine, voice, stats.get("audio_s") or 0,
+             stats.get("gen_s") or 0, " (streamed)" if streamed else "", out or "not saved")
+
+
 async def _speak(req: SpeechRequest):
     engine_name, voice, params = _resolve(req)
     engine = ENGINES[engine_name]
@@ -355,10 +360,11 @@ async def _speak(req: SpeechRequest):
     if req.stream:
         await engine.ensure_loaded()
         sr = engine.info.get("sample_rate", 24000)
-        out_path = None if req.no_save else _output_path(voice, "wav", req.save_dir)
+        save_fmt = req.format if req.format != "pcm" else "wav"
+        out_path = None if req.no_save else _output_path(voice, save_fmt, req.save_dir)
 
         async def body():
-            parts = []
+            parts, stats = [], {}
             gen = engine.generate(request_id=uuid.uuid4().hex[:8], **params)
             try:
                 async for item in gen:
@@ -366,10 +372,13 @@ async def _speak(req: SpeechRequest):
                         if out_path:
                             parts.append(item)
                         yield item
+                    else:
+                        stats = item
             finally:
                 await gen.aclose()
             if out_path:
-                out_path.write_bytes(audio.encode(b"".join(parts), sr, "wav"))
+                out_path.write_bytes(audio.encode(b"".join(parts), sr, save_fmt))
+            _log_done(engine_name, voice, stats, out_path, streamed=True)
 
         headers = {**base_headers, "X-Sample-Rate": str(sr), "X-Sample-Format": "s16le", "X-Channels": "1",
                    "X-LocalTTS-Saved": out_path.name if out_path else "no"}
@@ -381,6 +390,7 @@ async def _speak(req: SpeechRequest):
     pcm, stats = await _collect(engine, params)
     sr = engine.info.get("sample_rate", 24000)
     data = audio.encode(pcm, sr, req.format)
+    _log_done(engine_name, voice, stats, out, streamed=False)
     headers = {**base_headers, "X-Sample-Rate": str(sr),
                "X-Audio-Duration": str(stats.get("audio_s")), "X-RTF": str(stats.get("rtf")),
                "X-Generation-Seconds": str(stats.get("gen_s"))}

@@ -20,6 +20,7 @@ from .config import ROOT, settings
 
 log = logging.getLogger("localtts.engines")
 WORKERS = ROOT / "workers"
+DRAIN_TIMEOUT_S = 30.0  # longest we wait for an abandoned request before restarting the worker
 
 
 class EngineError(RuntimeError):
@@ -39,6 +40,7 @@ class Engine:
         self.loaded_at: float | None = None
         self._lock = asyncio.Lock()        # one request at a time per engine
         self._load_lock = asyncio.Lock()
+        self._stale = False  # an abandoned request is still emitting; read it off before the next
 
     # ---- lifecycle -------------------------------------------------------------------------
 
@@ -76,7 +78,7 @@ class Engine:
             log.info("%s: ready %s", self.name, self.info)
 
     async def unload(self, reason: str = "requested") -> bool:
-        proc, self.proc = self.proc, None
+        proc, self.proc, self._stale = self.proc, None, False
         self.state, self.info, self.loaded_at = "unloaded", {}, None
         if proc is None or proc.returncode is not None:
             return False
@@ -120,6 +122,8 @@ class Engine:
     async def generate(self, **params) -> AsyncIterator[bytes]:
         """Yield PCM s16le chunks; the final item is the worker's `done` stats dict."""
         async with self._lock:
+            if self._stale and self.alive:
+                await self._drain()
             await self.ensure_loaded()
             self.state = "busy"
             error = None
@@ -142,16 +146,33 @@ class Engine:
                 await self.unload(reason="worker died")
                 raise EngineError(f"{self.name}: worker died mid-request ({exc})") from exc
             except BaseException:
-                # Client went away or an error mid-stream: the worker may still be emitting
-                # audio for this request, so the channel is out of sync. Restart it.
+                # Client went away mid-stream (e.g. Cancel in the UI): the worker is still
+                # emitting audio for this request. Read it off before the next request rather
+                # than restarting the worker, which would cost a full model load.
                 if self.alive:
-                    await self.unload(reason="request aborted")
+                    self._stale = True
                 raise
             finally:
                 if self.alive:
                     self.state = "ready"
                 self.last_used = time.monotonic()
             raise error
+
+
+    async def _drain(self) -> None:
+        """Read off an abandoned request's remaining output; restart the worker if it takes long."""
+        log.info("%s: finishing an abandoned request first", self.name)
+        try:
+            async with asyncio.timeout(DRAIN_TIMEOUT_S):
+                while True:
+                    msg = await self._read_event()
+                    if msg.get("event") == "chunk":
+                        await self.proc.stdout.readexactly(msg["nbytes"])
+                    elif msg.get("event") in ("done", "error"):
+                        break
+            self._stale = False
+        except (TimeoutError, asyncio.IncompleteReadError, EngineError, ValueError):
+            await self.unload(reason=f"abandoned request still running after {DRAIN_TIMEOUT_S:.0f}s")
 
 
 async def transcribe(path: Path, language: str | None = None) -> str:
