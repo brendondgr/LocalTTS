@@ -6,10 +6,66 @@ An always-on local text-to-speech API on **http://127.0.0.1:5040**, backed by
 boot, and keeps nothing on the GPU while unused: each engine is unloaded after
 **10 minutes** without a request, and loads again on the next one.
 
-Interactive docs: http://127.0.0.1:5040/docs
+**Web UI: http://127.0.0.1:5040** (`localtts ui` opens it) · API docs: http://127.0.0.1:5040/docs
 
 > **Licence.** Breeze TTS 2 weights and outputs are research / non-commercial only.
 > Treat Breeze voices as test voices. Kokoro (Apache-2.0) has no such limit.
+
+## Web UI
+
+A chat: type text, pick a voice, get audio back. Everything the API does is in it:
+
+- **Voices** (sidebar): saved voices with their reference clip and transcript (editable), plus
+  **Add voice** (upload, drag and drop, or record from the microphone; Whisper writes the
+  transcript if you leave it empty) and **Design voice** (describe one, Breeze keeps a sample).
+- **Composer**: voice picker (your voices, "Describe a voice…", Kokoro voices), **Direction**
+  (emotion, tone, pace for Breeze), **Tags** (insert `(sigh)`, `(laugh)`… at the cursor) and
+  **Enhance** (below). The sliders button holds saving on/off, save folder, format, seed,
+  guidance, Kokoro speed and the Enhance style.
+- Each reply has a player, download, regenerate (new seed), edit-and-resend and copy.
+- **Settings**: the backend (this machine or a remote one, below), engine load/unload, the
+  Enhance model, and clearing history.
+
+Chats are kept in the browser (IndexedDB). With saving off, the audio is held in memory only
+and is gone after a reload, so nothing is written anywhere.
+
+### AI-Enhance
+
+**Enhance** sends the draft to an LLM, which inserts Breeze vocal-event tags where they fit
+and writes a delivery direction (e.g. "Resigned but lightly amused, unhurried."). The draft is
+replaced in place so you can review it, with **Undo**. It never changes your words; if the model
+does, the reply is flagged. *Subtle* adds about one tag per two or three sentences, *Expressive*
+more. Kokoro voices can't perform tags, so Enhance is off for them and tags are stripped from
+Kokoro requests.
+
+Tags Breeze documents (the only ones Enhance uses): `(laugh)` `(sigh)` `(cough)` `(clears throat)`.
+The Tags menu also lists experimental ones (`(chuckle)` `(gasp)` `(groan)` `(sniff)` `(breath)`
+`(hmm)` `(giggle)` `(cry)`): Breeze does not read them out as words, but whether each makes the
+sound has not been checked by ear.
+
+The LLM is any OpenAI-compatible endpoint: by default the DashLLM relay (`http://127.0.0.1:4000/v1`,
+model `auto`), which routes to whatever model is running. If none is, start one:
+
+```bash
+lcpp start gemma4-E4B      # ~10 GB; about 1.5 s per Enhance
+```
+
+`POST /v1/enhance {"text", "style": "subtle|expressive", "model"?, "direction"?}` returns
+`{"text", "delivery", "tags_added", "model", "warning"?}`; `GET /v1/enhance/tags` lists the tags.
+
+### Remote GPU backend
+
+The UI can drive another LocalTTS, e.g. one on the CUDA machine. Run LocalTTS there as usual
+(it stays bound to its own `127.0.0.1:5040`), forward it to this machine, and point the UI at it
+in **Settings → Backend → Another LocalTTS**:
+
+```bash
+ssh -N -L 5041:127.0.0.1:5040 user@gpu-box
+```
+
+then use `http://localhost:5041`. Voices, engines and saved files are that machine's;
+Enhance still runs here. The API accepts cross-origin requests from `localhost`/`127.0.0.1`
+pages only, so other websites cannot drive it.
 
 ## Control
 
@@ -21,9 +77,10 @@ localtts enable | disable           # start at boot (enabled by install.sh)
 localtts load [breeze|kokoro]       # load now instead of on first request
 localtts unload [engine]            # free the GPU now (default: all)
 localtts voices                     # saved + built-in voices
+localtts ui                         # open the web UI
 ```
 
-Generation goes through the API only.
+Generation goes through the web UI or the API.
 
 ## Voices
 
@@ -80,11 +137,16 @@ curl http://127.0.0.1:5040/v1/voices/design -H 'content-type: application/json' 
 | `format` | `wav` | `wav` `flac` `mp3` `ogg` `pcm` (raw s16le, 24 kHz mono) |
 | `stream` | false | stream raw PCM s16le as it is generated |
 | `no_save` | false | **return the audio only; nothing is written to disk** |
+| `save_dir` | `~/Music/TTS` | folder to save into (on the server); relative paths are under `~/Music/TTS` |
 
 ```bash
 # saved to ~/Music/TTS/ and returned
 curl http://127.0.0.1:5040/v1/speech -H 'content-type: application/json' \
      -d '{"text": "Hello there.", "name": "Brendon"}' -o hello.wav
+
+# saved to ~/Music/TTS/podcast/ (or give an absolute path)
+curl http://127.0.0.1:5040/v1/speech -H 'content-type: application/json' \
+     -d '{"text": "(sigh) Episode two.", "name": "Brendon", "save_dir": "podcast"}' -o ep2.wav
 
 # returned only, never written on this machine
 curl http://127.0.0.1:5040/v1/speech -H 'content-type: application/json' \
@@ -97,7 +159,7 @@ curl -N http://127.0.0.1:5040/v1/speech -H 'content-type: application/json' \
 ```
 
 Response headers: `X-LocalTTS-Engine`, `X-LocalTTS-Voice`, `X-Audio-Duration`, `X-RTF`,
-`X-LocalTTS-Saved` (the saved file name, or `no`), `X-LocalTTS-Path`.
+`X-LocalTTS-Saved` (the saved file name, or `no`), `X-LocalTTS-Path` (percent-encoded).
 
 Python:
 
@@ -116,7 +178,8 @@ base URL at `http://127.0.0.1:5040/v1`. `model` may be `breeze`, `kokoro` or any
 ### Saved outputs
 
 Everything generated without `no_save` lands in `~/Music/TTS/` (change it with
-`LOCALTTS_OUTPUTS_DIR`).
+`LOCALTTS_OUTPUTS_DIR`), or in the request's `save_dir`. The endpoints below cover the
+default folder.
 
 ```bash
 curl http://127.0.0.1:5040/v1/outputs                     # list (newest first)
@@ -181,6 +244,8 @@ Edit `~/.config/localtts/localtts.env`, then `localtts restart`. Common ones:
 | `LOCALTTS_OUTPUTS_DIR` | `~/Music/TTS` | where generated audio is saved (unless `no_save`) |
 | `LOCALTTS_PRELOAD` | empty | e.g. `breeze` to load at service start |
 | `LOCALTTS_DEFAULT_ENGINE` | kokoro | engine for requests with no voice and no instruction |
+| `LOCALTTS_LLM_URL` | `http://127.0.0.1:4000/v1` | OpenAI-compatible endpoint for AI-Enhance |
+| `LOCALTTS_LLM_MODEL` | `auto` | model id sent to it (the UI can pick another) |
 | `LOCALTTS_BREEZE_FAST` | `depth_decoder,backbone_decode` | empty = eager (RTF ~2.7, no warmup) |
 
 The full list is in `localtts.env.example`.

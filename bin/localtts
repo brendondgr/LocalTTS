@@ -33,7 +33,8 @@ usage: localtts <command>
   load [engine]    load an engine now (breeze|kokoro; default breeze)
   unload [engine]  unload an engine now (default: all)
   voices           list saved and built-in voices
-  url              print the base URL (API docs at \$URL/docs)
+  ui               open the web UI in the browser
+  url              print the base URL (web UI there, API docs at \$URL/docs)
 EOF
 }
 
@@ -104,6 +105,9 @@ if not v["custom"]:
     print("  (none)")
 print("kokoro built-in:", " ".join(v["kokoro"]))
 print("breeze design:  ", v["breeze_design"])' ;;
+  ui)
+    need_up; echo "$URL"
+    xdg-open "$URL" >/dev/null 2>&1 & disown ;;
   url)
     echo "$URL" ;;
   -h|--help|help)
