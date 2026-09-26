@@ -151,7 +151,8 @@ async def add_voice(
     payload = await audio_file.read()
     if not payload:
         raise HTTPException(400, "the audio upload is empty")
-    with tempfile.TemporaryDirectory(prefix="localtts-") as tmp:
+    # Staged next to the voices (same filesystem) so the final move is an atomic rename.
+    with tempfile.TemporaryDirectory(prefix=".upload-", dir=settings.voices_dir) as tmp:
         raw = Path(tmp) / ("upload" + (Path(audio_file.filename or "").suffix or ".bin"))
         raw.write_bytes(payload)
         ref = Path(tmp) / "reference.wav"
@@ -173,8 +174,12 @@ async def add_voice(
                              created=voices.now(), language=language, transcript_auto=auto)
         voices.delete(name)  # overwrite: drop the old folder (permanently) before writing the new one
         voice.dir.mkdir(parents=True)
-        ref.replace(voice.reference)
-        voices.save(voice)
+        try:
+            ref.replace(voice.reference)
+            voices.save(voice)
+        except Exception:
+            voices.delete(name)
+            raise
     out = voice.public()
     if dur > WARN_REF_S:
         out["warning"] = f"{dur:.0f}s is long; 10-25s references clone just as well and generate faster"

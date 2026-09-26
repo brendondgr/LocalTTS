@@ -78,7 +78,7 @@ def all_voices() -> list[Voice]:
     if not settings.voices_dir.is_dir():
         return []
     out = []
-    for meta in sorted(settings.voices_dir.glob("*/voice.json")):
+    for meta in sorted(settings.voices_dir.glob("[!.]*/voice.json")):
         try:
             out.append(Voice(**json.loads(meta.read_text())))
         except Exception:
