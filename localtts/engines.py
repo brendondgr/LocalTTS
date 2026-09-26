@@ -53,7 +53,7 @@ class Engine:
             if self.alive and self.state != "loading":
                 return
             if not self.python.exists():
-                raise EngineError(f"{self.name}: python not found at {self.python}")
+                raise EngineError(f"{self.name} is not installed (no Python at {self.python}); set it up with: bash engines/setup.sh --plan")
             self.state = "loading"
             log.info("%s: starting worker", self.name)
             env = {**os.environ, "PYTHONUNBUFFERED": "1", **self.env}
