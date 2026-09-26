@@ -26,7 +26,9 @@ def encode(pcm: bytes, sample_rate: int, fmt: str) -> bytes:
     audio = np.frombuffer(pcm, dtype="<i2")
     buf = io.BytesIO()
     container, subtype = SF_FORMATS[fmt]
-    sf.write(buf, audio, sample_rate, format=container, subtype=subtype)
+    # libsndfile's MP3 default is a very low VBR bitrate; 0.0 = best (160 kbps CBR at 24 kHz).
+    extra = {"compression_level": 0.0, "bitrate_mode": "CONSTANT"} if fmt == "mp3" else {}
+    sf.write(buf, audio, sample_rate, format=container, subtype=subtype, **extra)
     return buf.getvalue()
 
 
